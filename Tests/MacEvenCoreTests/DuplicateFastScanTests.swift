@@ -22,7 +22,7 @@ final class DuplicateFastScanTests {
     private func payload(_ count: Int, seed: UInt64) -> Data {
         var state = seed &* 6364136223846793005 &+ 1442695040888963407
         var data = Data(count: count)
-        data.withUnsafeMutableBytes { raw in
+        data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             for i in 0..<count {
                 state = state &* 6364136223846793005 &+ 1442695040888963407
                 raw[i] = UInt8(truncatingIfNeeded: state >> 33)
