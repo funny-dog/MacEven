@@ -1,0 +1,39 @@
+import Foundation
+
+/// 自动更新的完整性与签名规则辅助。
+public enum UpdateIntegrity {
+
+    /// 解析 `shasum -a 256` 输出（形如 `<hash>  <文件名>`），只接受 64 位十六进制，返回小写哈希。
+    ///
+    /// 不合格式一律返回 nil：GitHub 偶尔返回 HTML 错误页，若只取首个单词，
+    /// 会得到 `<!doctype` 这类"哈希"，虽然随后比对必然失败，但错误原因会被误报为"包被篡改"。
+    public static func parseChecksum(_ text: String) -> String? {
+        let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespaces).first ?? ""
+        return normalizedSHA256(token)
+    }
+
+    /// 解析 GitHub Releases API 中资源的 `digest` 字段（形如 `sha256:<hash>`），返回小写哈希。
+    ///
+    /// 字段缺失（旧版发布没有）或算法不是 sha256 时返回 nil，调用方应回退到 .sha256 文件。
+    public static func parseAssetDigest(_ digest: String?) -> String? {
+        guard let digest = digest?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        let prefix = "sha256:"
+        guard digest.lowercased().hasPrefix(prefix) else { return nil }
+        return normalizedSHA256(String(digest.dropFirst(prefix.count)))
+    }
+
+    /// 新版本必须满足的签名规则：由指定证书签发，且 bundle 标识匹配。
+    ///
+    /// 只有当前版本是证书签名时才能使用（ad-hoc 签名没有证书可比对，见 CodeSignatureCheck.leafCertificateSHA1）。
+    public static func signingRequirements(bundleIdentifier: String, leafCertificateSHA1 leaf: String) -> String {
+        "identifier \"\(bundleIdentifier)\" and certificate leaf = H\"\(leaf)\""
+    }
+
+    /// 只接受 64 位 ASCII 十六进制，统一转小写
+    private static func normalizedSHA256(_ token: String) -> String? {
+        // isHexDigit 也认全角数字，额外限定 ASCII
+        guard token.count == 64, token.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return nil }
+        return token.lowercased()
+    }
+}

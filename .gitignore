@@ -1,0 +1,21 @@
+.build/
+dist/
+.DS_Store
+*.xcodeproj/
+.swiftpm/
+build/
+*.dmg
+*.zip
+*.zip.sha256
+
+# 本地开发与助手配置
+/AGENTS.md
+*.log
+
+# 本地凭据与签名私钥
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key

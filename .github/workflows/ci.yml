@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 工具链版本
+        run: swift --version
+      - name: 核心、模型、界面与轻量资源检查
+        run: bash scripts/verify.sh --fast

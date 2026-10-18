@@ -1,0 +1,115 @@
+import Foundation
+import MacEvenCore
+
+final class TrashTests {
+    func testProtectionAndReplacement() throws {
+        try CoreTests().withTree { rawHome, index in
+            let home = try canonicalFileURL(rawHome)
+            let folder = home.appendingPathComponent("Downloads")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appendingPathComponent("a")
+            try Data([1]).write(to: file)
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken())
+            let service = TrashService(index: index, home: home)
+            XCTAssertNotNil(service.reasonBlocked(home))
+            XCTAssertNotNil(service.reasonBlocked(home.appendingPathComponent("Library/a")))
+            XCTAssertNotNil(service.reasonBlocked(home.appendingPathComponent(".ssh/key")))
+            XCTAssertNotNil(service.reasonBlocked(URL(fileURLWithPath: "/System")))
+            XCTAssertEqual(service.reasonBlocked(file), nil)
+            let entry = try index.largestFiles().first!
+            try FileManager.default.removeItem(at: file)
+            try Data([1,2,3]).write(to: file)
+            let result = service.move(ids: [entry.id])
+            XCTAssertEqual(result.count, 1)
+            XCTAssertNotNil(result[0].error)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+            let link = home.appendingPathComponent("linked")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: folder)
+            XCTAssertNotNil(service.reasonBlocked(link.appendingPathComponent("a")))
+        }
+    }
+
+    func testBlockKindMirrorsCleanupRules() throws {
+        try CoreTests().withTree { rawHome, index in
+            let home = try canonicalFileURL(rawHome)
+            let downloads = home.appendingPathComponent("Downloads")
+            try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
+            let file = downloads.appendingPathComponent("keep")
+            try Data([1]).write(to: file)
+            let hidden = home.appendingPathComponent(".cache")
+            try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true)
+            try Data([1]).write(to: hidden.appendingPathComponent("big"))
+            let link = home.appendingPathComponent("linked")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: downloads)
+            let store = ProtectionStore(url: home.appendingPathComponent("Library/Application Support/MacEven/protection.json"))
+            let protected = home.appendingPathComponent("Projects/Keep")
+            try FileManager.default.createDirectory(at: protected, withIntermediateDirectories: true)
+            _ = try store.addPath(protected)
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken())
+            let service = TrashService(index: index, home: home, protection: store)
+
+            XCTAssertEqual(service.blockKind(home.appendingPathComponent("Library/x")), BlockKind.libraryOrHidden)
+            XCTAssertEqual(service.blockKind(hidden.appendingPathComponent("big")), BlockKind.libraryOrHidden)
+            XCTAssertEqual(service.blockKind(URL(fileURLWithPath: "/System")), BlockKind.outsideHome)
+            XCTAssertEqual(service.blockKind(home), BlockKind.outsideHome)
+            XCTAssertEqual(service.blockKind(index.url), BlockKind.macevenSelf)
+            let protectedFile = protected.appendingPathComponent("doc")
+            if case .userProtected(let reason)? = service.blockKind(protectedFile) {
+                XCTAssertEqual(reason, store.reason(for: protectedFile))
+            } else { XCTFail("user-protected path should carry its reason") }
+            if case .pathInvalid? = service.blockKind(link.appendingPathComponent("keep")) {} else {
+                XCTFail("symlinked ancestor should be reported as invalid")
+            }
+            XCTAssertNil(service.blockKind(file))
+
+            // 结构化原因与既有清理文案必须同源，避免两套规则分叉。
+            for url in [home, home.appendingPathComponent("Library/x"), hidden.appendingPathComponent("big"),
+                        index.url, protectedFile, link.appendingPathComponent("keep"), file] {
+                XCTAssertEqual(service.blockKind(url)?.blockedMessage, service.reasonBlocked(url))
+            }
+        }
+    }
+
+    func testNativeTrashAndHardlinkReassignment() throws {
+        try CoreTests().withTree { rawHome, index in
+            let home = try canonicalFileURL(rawHome)
+            let a = home.appendingPathComponent("MacEven-check-\(UUID())")
+            try Data(repeating: 1, count: 10).write(to: a)
+            try FileManager.default.linkItem(at: a, to: home.appendingPathComponent("survivor"))
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken())
+            let entry = try index.largestFiles().first!
+            let results = TrashService(index: index, home: home).move(ids: [entry.id])
+            XCTAssertEqual(results.count, 1)
+            XCTAssertEqual(results[0].error, nil)
+            if let destination = results[0].destination { try FileManager.default.removeItem(at: destination) }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: entry.url.path))
+            XCTAssertEqual(try index.entry(id: entry.id)?.id, nil)
+            XCTAssertEqual(try index.entry(id: 1)?.logicalSize, 10)
+            XCTAssertEqual(try index.entry(id: 1)?.allocatedSize, entry.allocatedSize)
+            XCTAssertEqual(try index.largestFiles().count, 1)
+        }
+    }
+
+    func testParentChildAndPartialFailure() throws {
+        try CoreTests().withTree { rawHome, index in
+            let home = try canonicalFileURL(rawHome)
+            let folder = home.appendingPathComponent("MacEven-check-\(UUID())")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appendingPathComponent("中文'%_\n")
+            try Data([1,2,3]).write(to: file)
+            let bad = home.appendingPathComponent("bad")
+            try Data([1]).write(to: bad)
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken())
+            let parent = try index.children(of: 1).first { $0.isDirectory }!
+            let child = try index.children(of: parent.id).first!
+            let stale = try index.children(of: 1).first { $0.url.lastPathComponent == "bad" }!
+            try FileManager.default.removeItem(at: bad)
+            let result = TrashService(index: index, home: home).move(ids: [parent.id,child.id,stale.id])
+            XCTAssertEqual(result.count, 2)
+            XCTAssertEqual(result.filter { $0.error == nil }.count, 1)
+            for item in result { if let url = item.destination { try FileManager.default.removeItem(at: url) } }
+            XCTAssertEqual(try index.entry(id: child.id)?.id, nil)
+            XCTAssertEqual(try index.entry(id: stale.id)?.logicalSize, 1)
+        }
+    }
+}
