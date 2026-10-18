@@ -55,7 +55,7 @@ git push origin main
 git push origin "v$TASK_VERSION"
 ```
 
-`.github/workflows/ci.yml` 与 FinderRight 一样，仅在推送 `v*` 标签或手动运行时触发。macOS runner 执行 `scripts/verify.sh --fast`，不会替代发布机器上的 full 验证，也不会生成正式签名包或自动公开 Release。
+`.github/workflows/ci.yml` 与 FinderRight 一样，仅在推送 `v*` 标签或手动运行时触发。macOS runner 固定使用 Xcode 26.3（避免旧版 Swift 的编译器崩溃），执行 `scripts/verify.sh --fast`，不会替代发布机器上的 full 验证，也不会生成正式签名包或自动公开 Release。
 
 检查该标签对应的 CI 成功后再继续。失败时修复原因并重新验证，不用跳过检查的方式发布。
 

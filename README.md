@@ -73,7 +73,7 @@ MacEven 是原生 macOS 系统监控与磁盘管理工具，使用 Swift / Swift
 
 ### 🛠 从源码构建
 
-需要支持 Swift 6 的 Xcode 或 Command Line Tools。构建脚本生成当前 Mac 架构的应用包。
+需要支持 Swift 6.2+ 的 Xcode 或 Command Line Tools（CI 使用 Xcode 26.3）。构建脚本生成当前 Mac 架构的应用包。
 
 ```bash
 bash scripts/setup-signing.sh       # 仅首次：生成固定自签名证书；请备份私钥
@@ -143,7 +143,7 @@ Automatic updates require a ZIP and SHA-256 checksum information. Before install
 
 ### 🛠 Build from source
 
-Install Xcode or Command Line Tools with Swift 6 support. The build script produces an app for the current Mac's architecture.
+Install Xcode or Command Line Tools with Swift 6.2+ support (CI uses Xcode 26.3). The build script produces an app for the current Mac's architecture.
 
 ```bash
 bash scripts/setup-signing.sh       # first time only; back up the signing private key
