@@ -63,7 +63,7 @@ struct SettingsPage: View {
                     }
                     section(localized("通知")) {
                         row(localized("设备使用与低电量通知"), detail: localized("默认关闭；开启时才请求系统通知权限")) {
-                            Toggle(localized("设备使用与低电量通知"), isOn: Binding(get: { notifications.enabled }, set: notifications.setEnabled)).labelsHidden().toggleStyle(.switch)
+                            Toggle(localized("设备使用与低电量通知"), isOn: Binding(get: { notifications.enabled }, set: { notifications.setEnabled($0) })).labelsHidden().toggleStyle(.switch)
                         }
                         if let message = notifications.message { Text(message).font(.caption).foregroundStyle(Theme.warning) }
                     }
