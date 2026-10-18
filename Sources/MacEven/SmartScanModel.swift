@@ -172,8 +172,10 @@ extension AIStorageConfirmation {
     var canScan: Bool { !closed && !busy && !cache.busy && !removal.busy && !otherBusy() }
     var selectedCount: Int { cache.selection.count + developer.selection.count + leftovers.selection.count }
     var selectedSize: Int64 {
-        cache.selectedGroups.reduce(0) { $0 + ($1.allocatedSize ?? 0) } + developer.selectedGroups.reduce(0) { $0 + ($1.allocatedSize ?? 0) }
-            + leftovers.selectedGroups.reduce(0) { $0 + ($1.allocatedSize ?? 0) }
+        let cacheSize = cache.selectedGroups.reduce(Int64(0)) { $0 + ($1.allocatedSize ?? 0) }
+        let developerSize = developer.selectedGroups.reduce(Int64(0)) { $0 + ($1.allocatedSize ?? 0) }
+        let leftoverSize = leftovers.selectedGroups.reduce(Int64(0)) { $0 + ($1.allocatedSize ?? 0) }
+        return cacheSize + developerSize + leftoverSize
     }
     var canClean: Bool { !closed && !busy && !otherBusy() && (cache.canClean || developer.canClean || leftovers.canClean) }
 
@@ -239,17 +241,27 @@ extension AIStorageConfirmation {
             if cancellation.isCancelled { self.summary = localized("扫描已取消，结果不完整") }
             else if !self.cache.scanFailed && !self.developer.scanFailed && !self.leftovers.scanFailed {
                 let incomplete = self.cache.incomplete || self.developer.incomplete || self.leftovers.incomplete || (self.storage + self.aiStorage).contains(where: \.incomplete)
-                let details = [
+                var details: [String] = [
                     localized("应用缓存：\(self.cache.selectableCount) 项 · \(bytes(self.cache.selectableSize))"),
                     localized("开发与浏览器缓存：\(self.developer.otherCacheSelectableCount) 项 · \(bytes(self.developer.otherCacheSelectableSize))"),
                     localized("软件残留：\(self.leftovers.selectableCount) 项 · \(bytes(self.leftovers.selectableSize))")
-                ] + (self.developer.aiCacheSelectableCount > 0 ? [localized("AI 缓存：\(self.developer.aiCacheSelectableCount) 项 · \(bytes(self.developer.aiCacheSelectableSize))")] : []) + self.cache.errors.prefix(3).map { localized("应用缓存未完成：") + $0 }
-                    + self.developer.errors.prefix(3).map { localized("开发缓存未完成：") + $0 }
-                    + self.leftovers.errors.prefix(3).map { localized("软件残留未完成：") + $0 }
-                    + (self.cache.restrictions + self.developer.restrictions + self.leftovers.restrictions).prefix(6).map { localized("保留 \($0.count) 项：\($0.reason)") }
-                    + (self.aiStorage + self.storage).map { localized("\($0.location.name)：\(bytes($0.allocatedSize))") + ($0.issue.map { " · " + $0 } ?? "") }
+                ]
+                if self.developer.aiCacheSelectableCount > 0 {
+                    details.append(localized("AI 缓存：\(self.developer.aiCacheSelectableCount) 项 · \(bytes(self.developer.aiCacheSelectableSize))"))
+                }
+                details.append(contentsOf: self.cache.errors.prefix(3).map { localized("应用缓存未完成：") + $0 })
+                details.append(contentsOf: self.developer.errors.prefix(3).map { localized("开发缓存未完成：") + $0 })
+                details.append(contentsOf: self.leftovers.errors.prefix(3).map { localized("软件残留未完成：") + $0 })
+                let restrictions = self.cache.restrictions + self.developer.restrictions + self.leftovers.restrictions
+                details.append(contentsOf: restrictions.prefix(6).map { localized("保留 \($0.count) 项：\($0.reason)") })
+                details.append(contentsOf: (self.aiStorage + self.storage).map {
+                    localized("\($0.location.name)：\(bytes($0.allocatedSize))") + ($0.issue.map { " · " + $0 } ?? "")
+                })
                 let skipped = (self.storage + self.aiStorage).filter(\.skipped).count
-                let report = AnalysisReport(summary: localized("可清理 \(bytes(self.cache.selectableSize + self.developer.selectableSize + self.leftovers.selectableSize))") + (incomplete ? localized(" · 部分检查未完成") : localized(" · 扫描完成")) + (skipped > 0 ? localized(" · \(skipped) 处按规则跳过") : ""), details: details)
+                var reportSummary = localized("可清理 \(bytes(self.cache.selectableSize + self.developer.selectableSize + self.leftovers.selectableSize))")
+                reportSummary += incomplete ? localized(" · 部分检查未完成") : localized(" · 扫描完成")
+                if skipped > 0 { reportSummary += localized(" · \(skipped) 处按规则跳过") }
+                let report = AnalysisReport(summary: reportSummary, details: details)
                 self.lastAnalysis = report
             }
         }
