@@ -127,9 +127,12 @@ import MacEvenCore
         precondition(rows.map(\.kind) == [.oldSessions, .missingProjectSessions, .recentSessions, .snapshots, .plans], "unexpected row order: \(rows.map(\.kind))")
         precondition(rows[0].targets.map(\.url) == [oldCodex], "old row must only contain sessions older than the threshold")
         precondition(rows[0].detail.contains("90 天"), rows[0].detail)
-        precondition(rows[1].targets.map(\.url).sorted { $0.path < $1.path } == [archivedCodex, claudeSession].sorted { $0.path < $1.path },
-                     "missing-project row must only contain removed projects")
-        precondition(rows[2].targets.map(\.url).sorted { $0.path < $1.path } == [freshCodex, claudeSubagent].sorted { $0.path < $1.path })
+        let missingProjectURLs: [URL] = rows[1].targets.map(\.url).sorted { $0.path < $1.path }
+        let expectedMissingProjectURLs: [URL] = [archivedCodex, claudeSession].sorted { $0.path < $1.path }
+        precondition(missingProjectURLs == expectedMissingProjectURLs, "missing-project row must only contain removed projects")
+        let recentURLs: [URL] = rows[2].targets.map(\.url).sorted { $0.path < $1.path }
+        let expectedRecentURLs: [URL] = [freshCodex, claudeSubagent].sorted { $0.path < $1.path }
+        precondition(recentURLs == expectedRecentURLs)
         precondition(Set(rows.flatMap { $0.targets.map(\.id) }).count == rows.flatMap(\.targets).count, "rows must not overlap")
         // 阈值放宽后旧会话并入“其他会话”，勾选仍然有效
         let widened = AICleanupRows.rows(groups: scanned, ageDays: 365, now: Date())
