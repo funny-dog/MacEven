@@ -24,8 +24,6 @@ public final class DiskIndex {
                 CREATE INDEX IF NOT EXISTS children ON nodes(parent, allocated DESC, logical DESC, id);
                 CREATE INDEX IF NOT EXISTS purposes ON nodes(purpose, purposeBytes DESC) WHERE purpose<>0;
                 CREATE INDEX IF NOT EXISTS identity ON nodes(device,inode);
-                CREATE INDEX IF NOT EXISTS file_ranking ON nodes(allocated DESC,logical DESC,id) WHERE (mode & 61440)=32768 AND duplicate=0;
-                CREATE INDEX IF NOT EXISTS file_paths ON nodes(path) WHERE (mode & 61440)=32768 AND duplicate=0;
                 CREATE TABLE IF NOT EXISTS seen(device INTEGER,inode INTEGER,PRIMARY KEY(device,inode)) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS duplicate_files(
                     node_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, digest BLOB, sample BLOB);
@@ -62,7 +60,10 @@ public final class DiskIndex {
         defer { sqlite3_reset(stmt) }
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw failure() }
     }
-    func reset() throws { try execute("DELETE FROM nodes; DELETE FROM seen; DELETE FROM duplicate_files;") }
+    func reset() throws {
+        // 查询索引按需建立，重扫前移除，避免逐条扫描写入维护它们。
+        try execute("DROP INDEX IF EXISTS file_ranking; DROP INDEX IF EXISTS file_paths; DELETE FROM nodes; DELETE FROM seen; DELETE FROM duplicate_files;")
+    }
     func begin() throws { try execute("BEGIN IMMEDIATE") }
     func commit() throws { try execute("COMMIT") }
     func rollback() { try? execute("ROLLBACK") }
@@ -141,13 +142,15 @@ public final class DiskIndex {
             values: [id,Int64(max(0,min(limit,100))),Int64(max(0,offset))])
     }
     public func largestFiles(limit: Int = 100, offset: Int = 0) throws -> [DiskEntry] {
-        try rows("SELECT \(columns) FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 ORDER BY allocated DESC,logical DESC,id LIMIT ? OFFSET ?",
+        try execute("CREATE INDEX IF NOT EXISTS file_ranking ON nodes(allocated DESC,logical DESC,id) WHERE (mode & 61440)=32768 AND duplicate=0")
+        return try rows("SELECT \(columns) FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 ORDER BY allocated DESC,logical DESC,id LIMIT ? OFFSET ?",
             values: [Int64(max(0,min(limit,100))), Int64(max(0,offset))])
     }
 
     /// 可清理范围粗筛：普通文件、位于主目录内、非 Library、无隐藏组件、不在应用包内部。
     /// 最终是否可清理仍由 TrashService.blockKind 逐项复核，索引查询只负责缩小候选集。
     public func largestCleanableFiles(homePath: String, limit: Int = 100, offset: Int = 0) throws -> [DiskEntry] {
+        try execute("CREATE INDEX IF NOT EXISTS file_ranking ON nodes(allocated DESC,logical DESC,id) WHERE (mode & 61440)=32768 AND duplicate=0")
         let base = homePath.hasSuffix("/") ? String(homePath.dropLast()) : homePath
         let homePrefix = base + "/"
         let libraryPrefix = base + "/Library/"
@@ -611,6 +614,7 @@ public final class DiskIndex {
         setCancelHandler(token: token)
         defer { withExtendedLifetime(token) { setCancelHandler(token: nil) } }
 
+        try execute("CREATE INDEX IF NOT EXISTS file_paths ON nodes(path) WHERE (mode & 61440)=32768 AND duplicate=0")
         let (prefix, upper) = scopeBounds(for: dirEntry.url.path)
         let sql = """
             SELECT category, COUNT(*), COALESCE(SUM(allocated), 0)
@@ -659,6 +663,7 @@ public final class DiskIndex {
         setCancelHandler(token: token)
         defer { withExtendedLifetime(token) { setCancelHandler(token: nil) } }
 
+        try execute("CREATE INDEX IF NOT EXISTS file_paths ON nodes(path) WHERE (mode & 61440)=32768 AND duplicate=0")
         let cappedLimit = max(0, min(limit, 100))
         let safeOffset = max(0, offset)
         let (prefix, upper) = scopeBounds(for: dirEntry.url.path)

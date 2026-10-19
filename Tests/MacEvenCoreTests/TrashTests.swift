@@ -14,12 +14,22 @@ final class TrashTests {
             }
             try fm.linkItem(at: home.appendingPathComponent("Downloads/delete/a"), to: home.appendingPathComponent("Documents/keep/link"))
             _ = try Scanner.scan(root: home, index: index, token: CancellationToken(), purposes: classifier)
-            let downloads = try index.children(of: 1).first { $0.name == "Downloads" }!
-            let deleting = try index.children(of: downloads.id).first { $0.name == "delete" }!
-            let keep = try index.largestFiles().first { $0.name == "b" }!
             var db: OpaquePointer?
             precondition(sqlite3_open(index.url.path, &db) == SQLITE_OK)
             defer { sqlite3_close(db) }
+            func queryIndexes() -> Set<String> {
+                var statement: OpaquePointer?
+                precondition(sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('file_ranking','file_paths')", -1, &statement, nil) == SQLITE_OK)
+                defer { sqlite3_finalize(statement) }
+                var names = Set<String>()
+                while sqlite3_step(statement) == SQLITE_ROW { names.insert(String(cString: sqlite3_column_text(statement, 0))) }
+                return names
+            }
+            XCTAssertEqual(queryIndexes(), [])
+            let downloads = try index.children(of: 1).first { $0.name == "Downloads" }!
+            let deleting = try index.children(of: downloads.id).first { $0.name == "delete" }!
+            let keep = try index.largestFiles().first { $0.name == "b" }!
+            XCTAssertEqual(queryIndexes(), ["file_ranking"])
             let trigger = "CREATE TRIGGER untouched BEFORE UPDATE ON nodes WHEN OLD.id=\(keep.id) BEGIN SELECT RAISE(ABORT,'unrelated row rewritten'); END"
             precondition(sqlite3_exec(db, trigger, nil, nil, nil) == SQLITE_OK)
             try fm.removeItem(at: deleting.url)
@@ -43,8 +53,20 @@ final class TrashTests {
             }
             let ranking = plan("SELECT id FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 ORDER BY allocated DESC,logical DESC,id LIMIT 100")
             precondition(ranking.contains("file_ranking") && !ranking.contains("TEMP B-TREE"), ranking)
+            _ = try index.spaceStats(directoryID: 1, token: CancellationToken())
+            XCTAssertEqual(queryIndexes(), ["file_ranking", "file_paths"])
             let paths = plan("SELECT category,SUM(allocated) FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 AND path>='/x/' AND path<'/x0' GROUP BY category")
             precondition(paths.contains("file_paths"), paths)
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken(), purposes: classifier)
+            XCTAssertEqual(queryIndexes(), [])
+            let cancelled = CancellationToken(); cancelled.cancel()
+            XCTAssertThrowsError(try index.spaceStats(directoryID: 1, token: cancelled))
+            XCTAssertThrowsError(try index.spacePage(directoryID: 1, filter: try SpaceFilter(), token: cancelled))
+            XCTAssertEqual(queryIndexes(), [])
+            XCTAssertEqual(try index.largestCleanableFiles(homePath: home.path).count, 3)
+            XCTAssertEqual(queryIndexes(), ["file_ranking"])
+            XCTAssertEqual(try index.spacePage(directoryID: 1, filter: try SpaceFilter(), token: CancellationToken()).totalCount, 3)
+            XCTAssertEqual(queryIndexes(), ["file_ranking", "file_paths"])
         }
     }
 
