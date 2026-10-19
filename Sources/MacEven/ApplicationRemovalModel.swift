@@ -342,7 +342,10 @@ struct ApplicationConfirmation: Identifiable, Equatable {
                         guard !cancellation.isCancelled else { throw MacEvenError(localized("关联数据检查已取消。")) }
                         plans.append(try remover.prepareDataRemoval(id: app.id, token: cancellation, isRunning: { _ in false }))
                     }
-                    if single { preview = try? remover.inspectRelatedData(id: apps[0].id, token: cancellation) }
+                    if single {
+                        guard !cancellation.isCancelled else { throw MacEvenError(localized("关联数据检查已取消。")) }
+                        preview = try? remover.inspectRelatedData(id: apps[0].id, token: cancellation, reusing: plans.first)
+                    }
                 }
                 let matches = dock?.matches(appPaths: apps.map(\.url.path), bundleIdentifiers: apps.map(\.bundleIdentifier)) ?? []
                 let frozen = ApplicationConfirmation(generation: run, applications: apps, dataPlans: plans, relatedData: preview, includingData: includingData, dockMatches: matches)

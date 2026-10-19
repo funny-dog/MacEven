@@ -144,8 +144,18 @@ struct SoftwareConfirmation: Identifiable, Sendable {
             do {
                 let result = try startup.service.scan(token: cancellation, includeServices: false)
                 await self?.publishStartup(result, run: run)
-                await self?.finish(run: run, message: localized("登录项读取完成 · 共 \(result.items.count) 个自启应用"))
-            } catch { await self?.finish(run: run, message: localized("登录项检查失败：") + error.localizedDescription) }
+                if cancellation.isCancelled || result.incomplete {
+                    await self?.finish(run: run, message: localized("检查已取消 · 未完成项保持尚未检查"))
+                } else {
+                    await self?.finish(run: run, message: localized("登录项读取完成 · 共 \(result.items.count) 个自启应用"))
+                }
+            } catch {
+                if cancellation.isCancelled {
+                    await self?.finish(run: run, message: localized("检查已取消 · 未完成项保持尚未检查"))
+                } else {
+                    await self?.finish(run: run, message: localized("登录项检查失败：") + error.localizedDescription)
+                }
+            }
         }
     }
     func promptAddStartupItem() {

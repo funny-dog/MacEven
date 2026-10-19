@@ -23,6 +23,18 @@ final class OtherStorageTests {
             XCTAssertEqual(measured.items, 3)
             XCTAssertEqual(OtherStorage.measure(locations.first { $0.name == "Ollama 模型" }!, token: CancellationToken()), nil)
             XCTAssertNotNil(OtherStorage.measure(archives, token: CancellationToken(), limit: 1)?.issue)
+            let child = StorageLocation(name: "child", url: archives.url.appendingPathComponent("2026-10-11"), note: "")
+            let shared = OtherStorage.measure([archives, child, archives], token: CancellationToken())
+            XCTAssertEqual(shared.count, 3)
+            XCTAssertEqual(shared[0], measured)
+            XCTAssertEqual(shared[2], measured)
+            XCTAssertEqual(shared[1], OtherStorage.measure(child, token: CancellationToken()))
+            let limited = OtherStorage.measure([archives, child], token: CancellationToken(), limit: 1)
+            XCTAssertNotNil(limited.first?.issue)
+            // 未受影响的位置必须保留旧快照；刷新不能顺便重新遍历整个清单。
+            let stale = StorageMeasurement(location: child, allocatedSize: 123, items: 5, issue: nil)
+            let untouched = OtherStorage.refresh([stale], locations: [child], changedPaths: [outside.path], token: CancellationToken())
+            XCTAssertEqual(untouched, [stale])
             let cancelled = CancellationToken(); cancelled.cancel()
             XCTAssertNotNil(OtherStorage.measure(archives, token: cancelled)?.issue)
             if geteuid() != 0 {

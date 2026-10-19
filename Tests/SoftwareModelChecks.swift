@@ -194,6 +194,33 @@ final class Tracker: @unchecked Sendable {
         while reentrancyModel.busy { try await Task.sleep(for: .milliseconds(10)) }
         precondition(!reentrancyModel.busy && reentrancyModel.status.contains("成功更新 2 个软件"), "reentrancyModel should complete properly")
 
+        // 4. 启动项检查取消报告
+        final class BlockingRunner: @unchecked Sendable {
+            let lock = NSLock()
+            private var started = false
+            var entered: Bool { lock.withLock { started } }
+            func run(url: URL, args: [String], token: CancellationToken?) throws -> SoftwareCommandResult {
+                lock.withLock { started = true }
+                let deadline = Date().addingTimeInterval(2)
+                while token?.isCancelled != true && Date() < deadline { usleep(1_000) }
+                precondition(token?.isCancelled == true, "read-only command did not receive cancellation")
+                throw MacEvenError("检查已取消。")
+            }
+        }
+        let blockingRunner = BlockingRunner()
+        let blockingStartup = StartupItems(systemRoots: [], cancellableRunner: blockingRunner.run)
+        let startupModel = SoftwareModel(startup: blockingStartup)
+        startupModel.refreshStartup()
+        precondition(startupModel.busy, "model should be busy during startup refresh")
+        let startupDeadline = Date().addingTimeInterval(2)
+        while !blockingRunner.entered {
+            precondition(Date() < startupDeadline, "startup command did not begin")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        startupModel.cancel()
+        while startupModel.busy { try await Task.sleep(for: .milliseconds(10)) }
+        precondition(startupModel.status.contains("检查已取消"), "cancelled startup refresh must report cancelled: \(startupModel.status)")
+
         print("Software model checks passed")
     }
 }

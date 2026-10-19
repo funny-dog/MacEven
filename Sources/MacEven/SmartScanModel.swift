@@ -77,7 +77,9 @@ extension AIStorageConfirmation {
     var leftovers: LeftoverModel { removal.leftovers }
 
     // AI 工作资料独立清理状态与属性
-    @Published private(set) var aiWorkGroups: [AIWorkCleanupGroup] = []
+    @Published private(set) var aiWorkGroups: [AIWorkCleanupGroup] = [] { didSet { rebuildAIWorkRows() } }
+    @Published private(set) var aiWorkRows: [AICleanupRow] = []
+    private var aiWorkTargetsByID: [String: AIWorkCleanupTarget] = [:]
     @Published private(set) var aiWorkConfirmation: AIWorkConfirmation?
     @Published private(set) var aiWorkCleaning: Bool = false
     @Published private(set) var aiWorkSummary: String?
@@ -87,7 +89,7 @@ extension AIStorageConfirmation {
     @Published private(set) var aiWorkSelection = Set<String>()
     /// 面板中展开明细的行与“保留的工作资料”只读区。
     @Published var aiWorkExpandedRows = Set<String>()
-    @Published var aiWorkAgeDays = 90
+    @Published var aiWorkAgeDays = 90 { didSet { rebuildAIWorkRows() } }
     @Published var aiWorkStorageExpanded = false
     @Published var aiCacheExpanded = false
     /// 一次最多勾选的会话与工作记录数，避免误点“选择全部”造成超大范围清理。
@@ -209,18 +211,19 @@ extension AIStorageConfirmation {
                 self.phase = .measuring
                 let ordinary = OtherStorage.locations(home: home)
                 let locations = ordinary + OtherStorage.aiLocations(home: home)
-                var measured: [StorageMeasurement] = []
                 self.measuring = (0, locations.count)
-                for (offset, location) in locations.enumerated() {
-                    if cancellation.isCancelled { break }
-                    if let value = await Task.detached(operation: { OtherStorage.measure(location, token: cancellation) }).value { measured.append(value) }
-                    self.measuring = (offset + 1, locations.count)
-                }
+                let measured = await Task.detached(priority: .utility) { [self] in
+                    OtherStorage.measure(locations, token: cancellation) { done in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.phase == .measuring, !self.measuringAI else { return }
+                            self.measuring = (done, locations.count)
+                        }
+                    }
+                }.value
                 // 位置统计完成后第 4 步还没结束：AI 工作资料扫描仍在同一步内，进度停满而不是退回步首。
                 self.measuring = (locations.count, locations.count)
                 self.measuringAI = true
-                self.storage = measured.filter { item in ordinary.contains { $0.id == item.id } }.sorted { $0.allocatedSize > $1.allocatedSize }
-                self.aiStorage = measured.filter { item in !ordinary.contains { $0.id == item.id } }.sorted { $0.allocatedSize > $1.allocatedSize }
+                self.applyStorageMeasurements(measured)
                 let cleanup = self.aiCleanup
                 do {
                     let result = try await Task.detached(priority: .utility) {
@@ -348,17 +351,19 @@ extension AIStorageConfirmation {
     // MARK: - AI Agent 会话与工作记录独立清理入口（不混入一键缓存清理）
 
     /// 面板展示行：旧会话、项目已删除的会话、其他会话、快照与计划。
-    var aiWorkRows: [AICleanupRow] {
-        AICleanupRows.rows(groups: aiWorkGroups, ageDays: aiWorkAgeDays)
+    private func rebuildAIWorkRows() {
+        aiWorkRows = AICleanupRows.rows(groups: aiWorkGroups, ageDays: aiWorkAgeDays)
+        aiWorkTargetsByID = [:]
+        for row in aiWorkRows { for target in row.targets { aiWorkTargetsByID[target.id] = target } }
     }
     var aiWorkTotalCount: Int { aiWorkGroups.reduce(0) { $0 + $1.count } }
     var aiWorkTotalSize: Int64 { aiWorkGroups.reduce(0) { $0 + $1.allocatedSize } }
     /// 当前年龄阈值下有资格勾选的全部记录。
     var aiWorkSelectableTargets: [AIWorkCleanupTarget] { aiWorkRows.flatMap(\.targets) }
     var aiWorkSelectedTargets: [AIWorkCleanupTarget] {
-        aiWorkSelectableTargets.filter { aiWorkSelection.contains($0.id) }
+        aiWorkSelection.sorted().compactMap { aiWorkTargetsByID[$0] }
     }
-    var aiWorkSelectedCount: Int { aiWorkSelectedTargets.count }
+    var aiWorkSelectedCount: Int { aiWorkSelection.reduce(0) { $0 + (aiWorkTargetsByID[$1] == nil ? 0 : 1) } }
     var aiWorkSelectedSize: Int64 { aiWorkSelectedTargets.reduce(0) { $0 + $1.allocatedSize } }
     func aiWorkSelectedCount(in row: AICleanupRow) -> Int { row.targets.filter { aiWorkSelection.contains($0.id) }.count }
     func isAIWorkSelected(_ target: AIWorkCleanupTarget) -> Bool { aiWorkSelection.contains(target.id) }
@@ -411,7 +416,7 @@ extension AIStorageConfirmation {
     }
 
     var canCleanAIWork: Bool {
-        canScan && !aiWorkSelectedTargets.isEmpty && aiWorkSelectedTargets.count == aiWorkSelection.count
+        canScan && !aiWorkSelection.isEmpty && aiWorkSelectedCount == aiWorkSelection.count
     }
 
     // MARK: - 「AI 清理与维护」卡片汇总
@@ -462,21 +467,21 @@ extension AIStorageConfirmation {
         guard let frozen = aiWorkConfirmation, canScan else { return }
         aiWorkConfirmation = nil; aiWorkCleaning = true; aiWorkSummary = nil
         let cleanup = aiCleanup, activity = aiWorkActivity, record = recordOperation, home = home
+        let previousGroups = aiWorkGroups, previousMeasurements = storage + aiStorage
         let cancellation = CancellationToken(); token = cancellation
         task = Task { [weak self] in
             guard let self else { return }
             let outcome = await Task.detached(priority: .utility) {
                 let results = cleanup.move(groups: frozen.groups, token: cancellation, activity: activity, recordOperation: record)
-                let groups = (try? cleanup.scan(token: cancellation)) ?? []
-                let measurements = OtherStorage.aiLocations(home: home).compactMap { location -> StorageMeasurement? in
-                    guard !cancellation.isCancelled else { return nil }
-                    return OtherStorage.measure(location, token: cancellation)
-                }.sorted { $0.allocatedSize > $1.allocatedSize }
+                let paths = results.filter { $0.destination != nil }.map(\.path)
+                let groups = (try? cleanup.remainingGroups(previousGroups)) ?? []
+                let measurements = OtherStorage.refresh(previousMeasurements, locations: OtherStorage.locations(home: home) + OtherStorage.aiLocations(home: home),
+                                                        changedPaths: paths, token: cancellation)
                 return (results, groups, measurements, cleanup.warnings)
             }.value
             let moved = outcome.0.filter { $0.destination != nil }
             let failed = outcome.0.filter { $0.error != nil }.count
-            self.aiWorkResults = outcome.0; self.aiWorkGroups = outcome.1; self.aiStorage = outcome.2; self.aiWorkWarnings = outcome.3
+            self.aiWorkResults = outcome.0; self.aiWorkGroups = outcome.1; self.applyStorageMeasurements(outcome.2); self.aiWorkWarnings = outcome.3
             self.aiWorkSelection.formIntersection(Set(outcome.1.flatMap { $0.targets.map(\.id) }))
             self.aiWorkSummary = localized("已移到废纸篓 \(moved.count) 项会话与工作记录 · 占用估算 \(bytes(moved.reduce(0) { $0 + ($1.allocatedSize ?? 0) }))")
                 + (failed > 0 ? localized(" · \(failed) 项保留或失败") : "")
@@ -534,6 +539,7 @@ extension AIStorageConfirmation {
         aiStorageConfirmation = nil; aiStorageCleaning = true; aiStorageSummary = nil
         let home = home, record = recordOperation
         let itemsToClean = frozen.items
+        let previousMeasurements = storage + aiStorage
         let cancellation = CancellationToken(); token = cancellation
 
         task = Task { [weak self] in
@@ -584,11 +590,8 @@ extension AIStorageConfirmation {
                     }
                 }
 
-                // 重新测量 AI 工作资料大小
-                let measurements = OtherStorage.aiLocations(home: home).compactMap { location -> StorageMeasurement? in
-                    guard !cancellation.isCancelled else { return nil }
-                    return OtherStorage.measure(location, token: cancellation)
-                }.sorted { $0.allocatedSize > $1.allocatedSize }
+                let measurements = OtherStorage.refresh(previousMeasurements, locations: OtherStorage.locations(home: home) + OtherStorage.aiLocations(home: home),
+                                                        changedPaths: results.filter { $0.destination != nil }.map(\.path), token: cancellation)
 
                 return (results, measurements)
             }.value
@@ -596,13 +599,20 @@ extension AIStorageConfirmation {
             let moved = outcome.0.filter { $0.destination != nil }
             let failed = outcome.0.filter { $0.error != nil }.count
             self.aiStorageResults = outcome.0
-            self.aiStorage = outcome.1
+            self.applyStorageMeasurements(outcome.1)
             self.aiStorageSelection.subtract(outcome.0.filter { $0.destination != nil }.map(\.path))
             self.aiStorageSummary = localized("已移到废纸篓 \(moved.count) 处工作资料 · 占用估算 \(bytes(moved.reduce(0) { $0 + ($1.allocatedSize ?? 0) }))")
                 + (failed > 0 ? localized(" · \(failed) 处保留或失败") : "")
                 + localized(" · 清空废纸篓后释放空间")
             self.aiStorageCleaning = false
         }
+    }
+
+    private func applyStorageMeasurements(_ measurements: [StorageMeasurement]) {
+        let ordinary = Set(OtherStorage.locations(home: home).map(\.id))
+        let unique = Dictionary(measurements.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values
+        storage = unique.filter { ordinary.contains($0.id) }.sorted { $0.allocatedSize > $1.allocatedSize }
+        aiStorage = unique.filter { !ordinary.contains($0.id) }.sorted { $0.allocatedSize > $1.allocatedSize }
     }
 
     func shutdown(_ completion: @escaping @MainActor @Sendable () -> Void) {

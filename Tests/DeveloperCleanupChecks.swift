@@ -110,6 +110,14 @@ import Darwin
         let result = try cleaner.scan(token: cancelled)
         precondition(result.summary.cancelled)
         precondition(cleaner.move(groupIDs: ["pip"], activity: { _, _ in nil }).allSatisfy { $0.destination == nil })
+        let opened = home.appendingPathComponent("occupancy-open.txt")
+        try Data([1]).write(to: opened)
+        let handle = try FileHandle(forReadingFrom: opened)
+        let files = DeveloperCleanupActivity.openFiles(at: opened)
+        precondition(files?.0 == 0 && files?.1.contains("n" + opened.path) == true, "targeted occupancy query missed an open file")
+        try handle.close()
+        let unrelated = DeveloperCleanupActivity.openFiles(at: home.appendingPathComponent("occupancy-closed.txt"))
+        precondition(unrelated?.1.contains("n" + opened.path) != true, "targeted query returned unrelated user files")
         print("PASS: ancestor replacement, content replacement, activity, second observation and cancellation")
 
         // Native observation failures are also conservative, without touching real user paths.

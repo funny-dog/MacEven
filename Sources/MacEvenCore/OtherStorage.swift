@@ -85,8 +85,39 @@ public enum OtherStorage {
         return entries.map { StorageLocation(name: $0.0, url: home.appendingPathComponent($0.1), note: $0.2) }
     }
 
+    /// 子目录先统计，父目录复用已完成的子树；同一路径只遍历一次。
+    public static func measure(_ locations: [StorageLocation], token: CancellationToken,
+                               limit: Int = 2_000_000, progress: @Sendable (Int) -> Void = { _ in }) -> [StorageMeasurement] {
+        var measured: [String: StorageMeasurement] = [:]
+        for (offset, location) in locations.sorted(by: { $0.url.path.count > $1.url.path.count }).enumerated() {
+            if token.isCancelled { break }
+            if measured[location.id] == nil {
+                measured[location.id] = measure(location, token: token, limit: limit, reusing: measured)
+            }
+            progress(offset + 1)
+        }
+        return locations.compactMap { location in
+            measured[location.id].map { StorageMeasurement(location: location, allocatedSize: $0.allocatedSize, items: $0.items, issue: $0.issue, skipped: $0.skipped) }
+        }
+    }
+
+    /// 仅刷新发生移动的位置及与之重叠的父子位置，其余结果保持当前扫描快照。
+    public static func refresh(_ previous: [StorageMeasurement], locations: [StorageLocation], changedPaths: [String],
+                               token: CancellationToken) -> [StorageMeasurement] {
+        let affected = locations.filter { location in changedPaths.contains { path in
+            path == location.id || path.hasPrefix(location.id + "/") || location.id.hasPrefix(path + "/")
+        } }
+        let ids = Set(affected.map(\.id))
+        return (previous.filter { !ids.contains($0.id) } + measure(affected, token: token)).sorted { $0.allocatedSize > $1.allocatedSize }
+    }
+
     /// 不跟随符号链接、不进入其他卷，最多统计 limit 个条目；位置不存在返回 nil。
     public static func measure(_ location: StorageLocation, token: CancellationToken, limit: Int = 2_000_000) -> StorageMeasurement? {
+        measure(location, token: token, limit: limit, reusing: [:])
+    }
+
+    private static func measure(_ location: StorageLocation, token: CancellationToken, limit: Int,
+                                reusing: [String: StorageMeasurement]) -> StorageMeasurement? {
         var ancestor = location.url.deletingLastPathComponent()
         while ancestor.path != "/" {
             if let info = try? FileIdentity.read(ancestor), info.isSymlink {
@@ -113,7 +144,11 @@ public enum OtherStorage {
             guard let info = try? FileIdentity.read(url) else { denied += 1; continue }
             if info.device != root.device { enumerator?.skipDescendants(); continue }
             if info.isSymlink { continue }
-            total += info.allocated
+            if info.isDirectory, let cached = reusing[url.path], !cached.incomplete, !cached.skipped,
+               cached.items <= limit - items {
+                total += cached.allocatedSize; items += cached.items
+                enumerator?.skipDescendants()
+            } else { total += info.allocated }
         }
         if enumerator == nil { issue = localized("无法枚举该位置（可能需要完全磁盘访问权限）。") }
         if issue == nil && denied > 0 { issue = localized("\(denied) 处无法读取（可能需要完全磁盘访问权限），合计偏小。") }

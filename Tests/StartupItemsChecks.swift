@@ -438,6 +438,49 @@ func createPlist(at url: URL, label: String, programArgs: [String]? = ["/bin/ech
         } catch {}
         print("  -> Passed 9: App Resolution & Login Items")
 
+        // ==========================================
+        // 10. 只读扫描即时取消与操作隔离 (Cancellation & Mutation Immunity)
+        // ==========================================
+        print("Checking 10: Read-only Token Cancellation & Mutation Immunity...")
+        final class TokenTrackingRunner: @unchecked Sendable {
+            let lock = NSLock()
+            var passedTokens: [Bool] = []
+            func run(executable: URL, args: [String], token: CancellationToken?) throws -> SoftwareCommandResult {
+                lock.lock()
+                passedTokens.append(token != nil)
+                let cancelled = token?.isCancelled == true
+                lock.unlock()
+                if cancelled {
+                    throw MacEvenError("检查已取消。")
+                }
+                if args.first == "-e" {
+                    return SoftwareCommandResult(status: 0, output: "MockApp\t/Applications/MockApp.app\tfalse\n", error: "")
+                }
+                return SoftwareCommandResult(status: 0, output: "", error: "")
+            }
+        }
+        let tracker = TokenTrackingRunner()
+        let trackingManager = StartupItems(home: home, systemRoots: systemRoots, cancellableRunner: tracker.run)
+        let activeToken = CancellationToken()
+        let preScan = try trackingManager.scan(token: activeToken, includeServices: false)
+        require(!preScan.items.isEmpty, "Scan with active token must succeed")
+        require(tracker.passedTokens.contains(true), "Scan must pass cancellation token to runner")
+
+        // 即时取消
+        let cancelToken = CancellationToken()
+        cancelToken.cancel()
+        let stoppedScan = try trackingManager.scan(token: cancelToken, includeServices: false)
+        require(stoppedScan.incomplete, "Cancelled scan must report incomplete")
+
+        // 增删操作不传取消令牌，不中断
+        tracker.passedTokens.removeAll()
+        let mockItem = StartupItem(id: "loginItem:MockApp:/Applications/MockApp.app", url: mockAppURL, label: "MockApp", kind: .loginItem)
+        try trackingManager.removeLoginItem(mockItem)
+        require(tracker.passedTokens.last == false, "removeLoginItem must pass nil token to protect mutation")
+        try trackingManager.addLoginItem(at: mockAppURL)
+        require(tracker.passedTokens.last == false, "addLoginItem must pass nil token to protect mutation")
+        print("  -> Passed 10: Read-only Token Cancellation & Mutation Immunity")
+
         print("All StartupItemsChecks passed successfully!")
     }
 }

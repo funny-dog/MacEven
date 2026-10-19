@@ -203,6 +203,14 @@ public enum DeveloperCleanupActivity {
         guard output[1].isEmpty, let text = String(data: output[0], encoding: .utf8) else { return nil }
         return (process.terminationStatus, text)
     }
+    static func openFiles(at root: URL? = nil) -> (Int32, String)? {
+        var arguments = ["-nP", "-a", "-u", String(getuid()), "-F", "n"]
+        if let root {
+            arguments += (try? FileIdentity.read(root).isDirectory) == true ? ["+D", root.path] : ["--", root.path]
+        }
+        return command("/usr/sbin/lsof", arguments, timeout: 10, maxBytes: 8_388_608)
+    }
+
     static func processReason(_ rule: DeveloperCleanupRule, _ output: String, advisory: Bool = false) -> String? {
         let names: [String]
         switch rule {
@@ -247,7 +255,7 @@ public enum DeveloperCleanupActivity {
         private let processProbeFailed: Bool
         private let lsofProbeFailed: Bool
 
-        public init() {
+        public init(root: URL? = nil) {
             let psResult = DeveloperCleanupActivity.command("/bin/ps", ["-A", "-o", "comm="])
             if let (status, text) = psResult, status == 0, !text.isEmpty {
                 self.processes = text
@@ -257,7 +265,7 @@ public enum DeveloperCleanupActivity {
                 self.processProbeFailed = true
             }
 
-            let lsofResult = DeveloperCleanupActivity.command("/usr/sbin/lsof", ["-nP", "-a", "-u", String(getuid()), "-F", "n"], timeout: 10, maxBytes: 8_388_608)
+            let lsofResult = DeveloperCleanupActivity.openFiles(at: root)
             if let (status, text) = lsofResult, status == 0 || status == 1 {
                 self.lsofProbeFailed = false
                 var paths: [String] = []
@@ -306,7 +314,7 @@ public enum DeveloperCleanupActivity {
     }
 
     public static func blockedReason(_ rule: DeveloperCleanupRule, _ root: URL) -> String? {
-        Snapshot().blockedReason(rule, root)
+        Snapshot(root: root).blockedReason(rule, root)
     }
 }
 

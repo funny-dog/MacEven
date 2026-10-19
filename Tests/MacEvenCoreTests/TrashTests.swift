@@ -1,7 +1,53 @@
 import Foundation
-import MacEvenCore
+import SQLite3
+@testable import MacEvenCore
 
 final class TrashTests {
+    func testLocalMaintenanceAndQueryPlans() throws {
+        try CoreTests().withTree { raw, index in
+            let home = try canonicalFileURL(raw).appendingPathComponent("home"), fm = FileManager.default
+            let classifier = PurposeClassifier(home: home)
+            for relative in ["Downloads/delete/a", "Documents/keep/b", "Downloads/plain"] {
+                let url = home.appendingPathComponent(relative)
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(repeating: 7, count: 4096).write(to: url)
+            }
+            try fm.linkItem(at: home.appendingPathComponent("Downloads/delete/a"), to: home.appendingPathComponent("Documents/keep/link"))
+            _ = try Scanner.scan(root: home, index: index, token: CancellationToken(), purposes: classifier)
+            let downloads = try index.children(of: 1).first { $0.name == "Downloads" }!
+            let deleting = try index.children(of: downloads.id).first { $0.name == "delete" }!
+            let keep = try index.largestFiles().first { $0.name == "b" }!
+            var db: OpaquePointer?
+            precondition(sqlite3_open(index.url.path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            let trigger = "CREATE TRIGGER untouched BEFORE UPDATE ON nodes WHEN OLD.id=\(keep.id) BEGIN SELECT RAISE(ABORT,'unrelated row rewritten'); END"
+            precondition(sqlite3_exec(db, trigger, nil, nil, nil) == SQLITE_OK)
+            try fm.removeItem(at: deleting.url)
+            try index.removeSubtree(id: deleting.id)
+            precondition(sqlite3_exec(db, "DROP TRIGGER untouched", nil, nil, nil) == SQLITE_OK)
+            let fresh = try DiskIndex(url: raw.appendingPathComponent("fresh.sqlite"))
+            defer { fresh.close() }
+            _ = try Scanner.scan(root: home, index: fresh, token: CancellationToken(), purposes: classifier)
+            XCTAssertEqual(try index.entry(id: 1)?.logicalSize, 12288)
+            XCTAssertEqual(try index.largestFiles().filter { $0.name == "a" || $0.name == "link" }.count, 1)
+            let before = try index.purposeTotals().map { "\($0.tag.rawValue):\($0.bytes)" }.sorted()
+            let after = try fresh.purposeTotals().map { "\($0.tag.rawValue):\($0.bytes)" }.sorted()
+            XCTAssertEqual(before, after)
+            func plan(_ sql: String) -> String {
+                var statement: OpaquePointer?
+                precondition(sqlite3_prepare_v2(db, "EXPLAIN QUERY PLAN " + sql, -1, &statement, nil) == SQLITE_OK)
+                defer { sqlite3_finalize(statement) }
+                var result = ""
+                while sqlite3_step(statement) == SQLITE_ROW { result += String(cString: sqlite3_column_text(statement, 3)) }
+                return result
+            }
+            let ranking = plan("SELECT id FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 ORDER BY allocated DESC,logical DESC,id LIMIT 100")
+            precondition(ranking.contains("file_ranking") && !ranking.contains("TEMP B-TREE"), ranking)
+            let paths = plan("SELECT category,SUM(allocated) FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 AND path>='/x/' AND path<'/x0' GROUP BY category")
+            precondition(paths.contains("file_paths"), paths)
+        }
+    }
+
     func testProtectionAndReplacement() throws {
         try CoreTests().withTree { rawHome, index in
             let home = try canonicalFileURL(rawHome)

@@ -24,6 +24,8 @@ public final class DiskIndex {
                 CREATE INDEX IF NOT EXISTS children ON nodes(parent, allocated DESC, logical DESC, id);
                 CREATE INDEX IF NOT EXISTS purposes ON nodes(purpose, purposeBytes DESC) WHERE purpose<>0;
                 CREATE INDEX IF NOT EXISTS identity ON nodes(device,inode);
+                CREATE INDEX IF NOT EXISTS file_ranking ON nodes(allocated DESC,logical DESC,id) WHERE (mode & 61440)=32768 AND duplicate=0;
+                CREATE INDEX IF NOT EXISTS file_paths ON nodes(path) WHERE (mode & 61440)=32768 AND duplicate=0;
                 CREATE TABLE IF NOT EXISTS seen(device INTEGER,inode INTEGER,PRIMARY KEY(device,inode)) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS duplicate_files(
                     node_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, digest BLOB, sample BLOB);
@@ -191,7 +193,6 @@ public final class DiskIndex {
         guard fresh.device == old.identity.device, fresh.mode == old.identity.mode,
             old.isDirectory ? fresh.inode == old.identity.inode : fresh.isRegular else { throw MacEvenError(localized("清理入口已被替换，请重新扫描。")) }
         try removeSubtree(id: id)
-        try execute("DELETE FROM seen WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE nodes.device=seen.device AND nodes.inode=seen.inode AND (nodes.mode & 61440)=32768)")
         let newID: Int64
         if fresh.isDirectory {
             let summary = try Scanner.scan(root: old.url, index: self, token: token, resetIndex: false, requireCompleteTraversal: true)
@@ -205,71 +206,85 @@ public final class DiskIndex {
     }
 
     func removeSubtree(id: Int64) throws {
+        guard let removed = try entry(id: id) else { return }
         try begin()
         do {
-            let stmt = try statement("WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT nodes.id FROM nodes JOIN tree ON nodes.parent=tree.id) DELETE FROM nodes WHERE id IN tree")
-            try bind([id], to: stmt); try done(stmt)
-            // Reassign hard-link ownership before rebuilding totals. Disk-backed, no full-tree array.
             try execute("""
-                UPDATE nodes SET duplicate=CASE WHEN id=(SELECT MIN(n.id) FROM nodes n WHERE n.device=nodes.device AND n.inode=nodes.inode) THEN 0 ELSE 1 END WHERE (mode & 61440)=32768;
-                UPDATE nodes SET ownLogical=CASE WHEN (mode & 61440)=32768 AND duplicate=0 THEN size ELSE 0 END,
-                    ownAllocated=CASE WHEN (mode & 61440)=32768 AND duplicate=0 THEN blocks ELSE 0 END;
-                UPDATE nodes SET logical=ownLogical,allocated=ownAllocated;
+                CREATE TEMP TABLE IF NOT EXISTS removal_nodes(id INTEGER PRIMARY KEY);
+                CREATE TEMP TABLE IF NOT EXISTS removal_identities(device INTEGER,inode INTEGER,PRIMARY KEY(device,inode)) WITHOUT ROWID;
+                DELETE FROM removal_nodes; DELETE FROM removal_identities;
                 """)
-            // 用途占用与扫描时同一口径：先记在文件上，自底向上交给最近的用途边界；不可继承的边界不接收。
-            let boundaries = try purposeBoundaries()
-            if !boundaries.isEmpty { try execute("UPDATE nodes SET purposeBytes=ownAllocated;") }
-            let carry = try statement("UPDATE nodes SET purposeBytes=purposeBytes+? WHERE id=?")
-            let cursor = try statement("SELECT id,parent,logical,allocated FROM nodes ORDER BY id DESC")
-            defer { sqlite3_reset(cursor) }
-            let update = try statement("UPDATE nodes SET logical=logical+?,allocated=allocated+? WHERE id=?")
+            let collect = try statement("WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent=t.id) INSERT INTO removal_nodes SELECT id FROM tree")
+            try bind([id], to: collect); try done(collect)
+            try execute("INSERT OR IGNORE INTO removal_identities SELECT device,inode FROM nodes WHERE id IN removal_nodes AND (mode & 61440)=32768 AND duplicate=0")
+            // 只有未遇到用途边界的字节会继续归给被删目录之外的祖先。
+            let carry = try statement("""
+                WITH RECURSIVE carry(id) AS (
+                    SELECT id FROM nodes WHERE id=? AND purpose=0
+                    UNION ALL SELECT n.id FROM nodes n JOIN carry c ON n.parent=c.id WHERE n.purpose=0
+                ) SELECT COALESCE(SUM(ownAllocated),0) FROM nodes WHERE id IN carry
+                """)
+            try bind([id], to: carry)
+            guard sqlite3_step(carry) == SQLITE_ROW else { throw failure() }
+            let unassigned = sqlite3_column_int64(carry, 0)
+            sqlite3_reset(carry)
+            try execute("DELETE FROM duplicate_files WHERE node_id IN removal_nodes; DELETE FROM nodes WHERE id IN removal_nodes;")
+            try adjustAncestors(from: removed.parentID, logical: -removed.logicalSize, allocated: -removed.allocatedSize)
+            try adjustPurpose(from: removed.parentID, bytes: -unassigned)
+
+            // 只为失去计数所有者的硬链接寻找下一份；其他文件及目录不重写。
+            let owners = try statement("""
+                SELECT MIN(n.id) FROM removal_identities r JOIN nodes n ON n.device=r.device AND n.inode=r.inode
+                WHERE (n.mode & 61440)=32768 GROUP BY r.device,r.inode
+                """)
+            defer { sqlite3_reset(owners) }
             while true {
-                let code = sqlite3_step(cursor)
+                let code = sqlite3_step(owners)
                 if code == SQLITE_DONE { break }
-                guard code == SQLITE_ROW else { throw failure() }
-                let nodeID = sqlite3_column_int64(cursor, 0)
-                let parent = sqlite3_column_int64(cursor, 1)
-                if parent == 0 { continue }
-                // Read fresh totals: children have updated this row since the cursor began.
-                if let node = try entry(id: nodeID) {
-                    sqlite3_reset(update); sqlite3_clear_bindings(update)
-                    try bind([node.logicalSize,node.allocatedSize,parent], to: update); try done(update)
-                }
-                if !boundaries.isEmpty, boundaries[nodeID] == nil, boundaries[parent].map(PurposeTag.isHeritable) ?? true {
-                    let bytes = try purposeBytes(id: nodeID)
-                    if bytes > 0 {
-                        sqlite3_reset(carry); sqlite3_clear_bindings(carry)
-                        try bind([bytes,parent], to: carry); try done(carry)
-                    }
-                }
+                guard code == SQLITE_ROW, let owner = try entry(id: sqlite3_column_int64(owners, 0)) else { throw failure() }
+                guard owner.duplicate else { continue }
+                let update = try statement("UPDATE nodes SET duplicate=0,ownLogical=size,ownAllocated=blocks,logical=size,allocated=blocks WHERE id=?")
+                try bind([owner.id], to: update); try done(update)
+                try adjustAncestors(from: owner.parentID, logical: owner.identity.size, allocated: owner.identity.allocated)
+                try adjustPurpose(from: owner.id, bytes: owner.identity.allocated, ownBoundary: true)
             }
-            if !boundaries.isEmpty { try execute("UPDATE nodes SET purposeBytes=0 WHERE purpose=0;") }
-            try execute("DELETE FROM duplicate_files WHERE node_id NOT IN (SELECT id FROM nodes);")
+            try execute("""
+                DELETE FROM seen WHERE (device,inode) IN (SELECT device,inode FROM removal_identities)
+                AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.device=seen.device AND n.inode=seen.inode AND (n.mode & 61440)=32768);
+                DELETE FROM removal_nodes; DELETE FROM removal_identities;
+                """)
             try commit()
         } catch { rollback(); throw error }
     }
 
-    /// 用途边界只占少数行，走部分索引；返回 id → 标记原值。
-    private func purposeBoundaries() throws -> [Int64: Int64] {
-        let stmt = try statement("SELECT id,purpose FROM nodes WHERE purpose<>0")
-        defer { sqlite3_reset(stmt) }
-        var result: [Int64: Int64] = [:]
-        while true {
-            let code = sqlite3_step(stmt)
-            if code == SQLITE_DONE { break }
-            guard code == SQLITE_ROW else { throw failure() }
-            result[sqlite3_column_int64(stmt, 0)] = sqlite3_column_int64(stmt, 1)
+    private func adjustAncestors(from id: Int64, logical: Int64, allocated: Int64) throws {
+        var current = id
+        while current != 0 {
+            guard let node = try entry(id: current) else { throw failure() }
+            let update = try statement("UPDATE nodes SET logical=logical+?,allocated=allocated+? WHERE id=?")
+            try bind([logical, allocated, current], to: update); try done(update)
+            current = node.parentID
         }
-        return result
     }
-    private func purposeBytes(id: Int64) throws -> Int64 {
-        let stmt = try statement("SELECT purposeBytes FROM nodes WHERE id=?")
-        try bind([id], to: stmt)
-        defer { sqlite3_reset(stmt) }
-        let code = sqlite3_step(stmt)
-        if code == SQLITE_DONE { return 0 }
-        guard code == SQLITE_ROW else { throw failure() }
-        return sqlite3_column_int64(stmt, 0)
+
+    private func adjustPurpose(from id: Int64, bytes: Int64, ownBoundary: Bool = false) throws {
+        guard bytes != 0 else { return }
+        var current = id
+        while current != 0 {
+            let cursor = try statement("SELECT parent,purpose FROM nodes WHERE id=?")
+            try bind([current], to: cursor)
+            guard sqlite3_step(cursor) == SQLITE_ROW else { throw failure() }
+            let parent = sqlite3_column_int64(cursor, 0), tag = sqlite3_column_int64(cursor, 1)
+            sqlite3_reset(cursor)
+            if tag != 0 {
+                if (current == id && ownBoundary) || PurposeTag.isHeritable(tag) {
+                    let update = try statement("UPDATE nodes SET purposeBytes=purposeBytes+? WHERE id=?")
+                    try bind([bytes, current], to: update); try done(update)
+                }
+                return
+            }
+            current = parent
+        }
     }
 
     /// 按用途标记汇总：每种标记有归属字节的边界数量与归属字节数。没有用途扫描时为空。

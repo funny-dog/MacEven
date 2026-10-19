@@ -235,8 +235,8 @@ public enum AIWorkActivity {
 
     public static func blockedReason(_ tool: AIWorkTool, _ url: URL) -> String? {
         // 会话与工作记录为历史文件，不因后台进程存活而阻断清理；仅在文件正被打开占用时保留。
-        guard let (status, files) = DeveloperCleanupActivity.command("/usr/sbin/lsof", ["-nP", "-a", "-u", String(getuid()), "-F", "n"], timeout: 10, maxBytes: 8_388_608), status == 0 || status == 1 else {
-            return nil
+        guard let (status, files) = DeveloperCleanupActivity.openFiles(at: url), status == 0 || status == 1 else {
+            return localized("文件占用核验失败、超时或不完整，已保留。")
         }
         let rootPath = url.path
         return files.split(separator: "\n").contains(where: { line in
@@ -394,12 +394,14 @@ public final class AIWorkCleanup: @unchecked Sendable {
             do {
                 let candidates = try candidates(rule: rule, token: token)
                 var targets: [AIWorkCleanupTarget] = []
+                var pending = 0
+                if rule.isSessionFile { try index.begin() }
                 for url in candidates {
                     guard !token.isCancelled else { break }
                     do {
                         try validateSafety(url, rule: rule)
                         let parents = try ancestors(of: url), identity = try FileIdentity.read(url)
-                        guard identity.isDirectory || identity.isRegular else { throw MacEvenError(localized("候选既不是目录也不是普通文件，已保留：\(url.path)")) }
+                        guard (identity.isDirectory || identity.isRegular), !rule.isSessionFile || identity.isRegular else { throw MacEvenError(localized("候选既不是目录也不是普通文件，已保留：\(url.path)")) }
                         let root: Int64
                         if identity.isDirectory {
                             let summary = try Scanner.scan(root: url, index: index, token: token, resetIndex: false, requireCompleteTraversal: true) { progress in
@@ -410,7 +412,13 @@ public final class AIWorkCleanup: @unchecked Sendable {
                                 throw MacEvenError(localized("工作记录统计不完整，已保留：\(url.path)"))
                             }
                             root = summary.rootID
-                        } else { root = try index.insert(parent: 0, url: url, identity: identity).id }
+                        } else {
+                            root = try index.insert(parent: 0, url: url, identity: identity).id
+                            if rule.isSessionFile {
+                                pending += 1
+                                if pending == 500 { try index.commit(); try index.begin(); pending = 0 }
+                            }
+                        }
                         roots[url.path] = root
                         // 会话文件按修改时间与记录的工作目录补充说明；读取失败或无法确认时保持保守。
                         let context = rule.isSessionFile ? AIWorkSessionProbe.context(of: url, identity: identity) : nil
@@ -420,8 +428,10 @@ public final class AIWorkCleanup: @unchecked Sendable {
                             projectPath: context?.projectPath, projectName: context?.projectName, projectMissing: context?.projectMissing == true))
                     } catch { warnings.append(error.localizedDescription) }
                 }
+                if rule.isSessionFile { try index.commit() }
                 if !targets.isEmpty { groups.append(AIWorkCleanupGroup(rule: rule, targets: targets)) }
             } catch {
+                index.rollback()
                 let error = error as NSError
                 if error.domain != NSPOSIXErrorDomain || error.code != Int(ENOENT) { warnings.append(error.localizedDescription) }
             }
@@ -480,8 +490,10 @@ public final class AIWorkCleanup: @unchecked Sendable {
                     guard current.isDirectory, !current.isSymlink, current.device == old.device, current.inode == old.inode else { throw MacEvenError(localized("祖先目录已变化，记录保留。")) }
                 }
                 try index.validateSubtree(id: root)
-                roots[target.id] = nil
                 try FileManager.default.trashItem(at: target.url, resultingItemURL: &destination)
+                roots[target.id] = nil
+                do { try index.removeSubtree(id: root) }
+                catch { roots = [:]; throw error }
                 results.append(TrashResult(
                     id: 0,
                     path: target.url.path,
@@ -510,6 +522,20 @@ public final class AIWorkCleanup: @unchecked Sendable {
         }
 
         return results
+    }
+
+    /// 复用仍有效的扫描快照，读取局部索引维护后的大小，不再遍历所有会话目录。
+    public func remainingGroups(_ groups: [AIWorkCleanupGroup]) throws -> [AIWorkCleanupGroup] {
+        guard let index else { return [] }
+        return try groups.compactMap { group in
+            let retained = try group.targets.compactMap { target -> AIWorkCleanupTarget? in
+                guard let root = roots[target.id], let entry = try index.entry(id: root) else { return nil }
+                return AIWorkCleanupTarget(rule: target.rule, url: target.url, allocatedSize: entry.allocatedSize,
+                    identity: target.identity, ancestors: target.ancestors, impact: target.impact, modifiedAt: target.modifiedAt,
+                    projectPath: target.projectPath, projectName: target.projectName, projectMissing: target.projectMissing)
+            }
+            return retained.isEmpty ? nil : AIWorkCleanupGroup(rule: group.rule, targets: retained)
+        }
     }
 
     public func move(

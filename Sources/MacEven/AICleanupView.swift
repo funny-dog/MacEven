@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 import MacEvenCore
 
+private typealias AICleanupViewState<Value> = SwiftUI.State<Value>
+
 /// 「AI 清理与维护」三件事各自说清楚后果：
 /// 缓存会重建（随页面底部的「移到废纸篓」一起执行）；会话与工作记录不可恢复，只能在这里逐项勾选并单独确认。
 struct AICleanupPanelView: View {
@@ -9,6 +11,7 @@ struct AICleanupPanelView: View {
     @ObservedObject var developer: DeveloperCleanupModel
 
     @Environment(\.advancedMode) private var advanced
+    @AICleanupViewState private var sessionOffsets: [String: Int] = [:]
 
     private var cacheGroups: [DeveloperCleanupGroup] { developer.aiCacheGroups }
 
@@ -21,6 +24,8 @@ struct AICleanupPanelView: View {
             CleanupResultsSection(results: smart.aiWorkResults, errors: smart.aiWorkWarnings)
             readOnlySection
         }
+        .onChange(of: smart.aiWorkAgeDays) { _, _ in sessionOffsets = [:] }
+        .onChange(of: smart.scanningAll) { _, scanning in if scanning { sessionOffsets = [:] } }
     }
 
     // MARK: - 标题与提示
@@ -223,12 +228,16 @@ struct AICleanupPanelView: View {
     }
 
     private func sessionTargetList(_ row: AICleanupRow) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let offset = min(sessionOffsets[row.id] ?? 0, max(0, (row.count - 1) / 100 * 100))
+        return VStack(alignment: .leading, spacing: 8) {
             if row.leavesEmptyDirectories {
                 Text(localized("会话文件移走后可能留下空的日期目录，不影响工具继续使用。"))
                     .font(.system(size: 11)).foregroundStyle(Theme.faint)
             }
-            ForEach(row.targets) { target in sessionTargetRow(target) }
+            ForEach(Array(row.targets.dropFirst(offset).prefix(100))) { target in sessionTargetRow(target) }
+            Pager(page: offset / 100 + 1, canPrevious: offset > 0, canNext: offset + 100 < row.count,
+                  previous: { sessionOffsets[row.id] = max(0, offset - 100) },
+                  next: { sessionOffsets[row.id] = offset + 100 })
         }
         .padding(.leading, 8)
     }

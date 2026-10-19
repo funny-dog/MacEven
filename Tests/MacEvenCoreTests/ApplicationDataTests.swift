@@ -41,7 +41,16 @@ final class ApplicationDataTests {
         }
         var plan = try prepare()
         precondition(Set(plan.paths.map(\.path)) == Set([cache, support, container, preferences, byHost, suffixed].map(\.path)), "incorrect data scope")
-        try Data([7,8]).write(to: support.appendingPathComponent("data"))
+        let originalSupportSize = try FileIdentity.read(support.appendingPathComponent("data")).allocated
+        let dataHandle = try FileHandle(forWritingTo: support.appendingPathComponent("data"))
+        try dataHandle.truncate(atOffset: 0)
+        try dataHandle.write(contentsOf: Data(repeating: 7, count: 32768))
+        try dataHandle.close()
+        let frozenPreview = try remover.inspectRelatedData(id: app.path, token: CancellationToken(), reusing: plan)
+        let freshPreview = try remover.inspectRelatedData(id: app.path, token: CancellationToken())
+        let frozenSize = frozenPreview.items.first { $0.url.path == support.path }?.allocatedSize
+        let freshSize = freshPreview.items.first { $0.url.path == support.path }?.allocatedSize
+        precondition(frozenSize == originalSupportSize && (freshSize ?? 0) > (frozenSize ?? 0), "plan reuse mismatch: frozen=\(String(describing: frozenSize)), fresh=\(String(describing: freshSize)), original=\(originalSupportSize)")
         var results = remover.moveIncludingData(plan: plan, isRunning: { _ in false })
         precondition(results.allSatisfy { $0.destination == nil && $0.error != nil } && fm.fileExists(atPath: app.path), "deep data change accepted")
         plan = try prepare()
@@ -158,6 +167,11 @@ final class ApplicationDataTests {
         precondition(preview.includedSize > 0 && preview.retainedSize > 0 && preview.allocatedSize == preview.includedSize + preview.retainedSize, "size split incorrect: \(preview)")
         let plan = try remover.prepareDataRemoval(id: app.path, token: CancellationToken(), isRunning: { _ in false })
         precondition(Set(plan.paths.map(\.path)) == Set([hidden.path, suffixed.path]), "unexpected removal scope: \(plan.paths)")
+        let postPlanPreview = try remover.inspectRelatedData(id: app.path, token: CancellationToken(), reusing: plan)
+        precondition(postPlanPreview.includedSize == plan.allocatedSize, "post-plan preview includedSize must match plan allocatedSize: \(postPlanPreview.includedSize) vs \(plan.allocatedSize)")
+        precondition(postPlanPreview.retainedSize > 0, "uncovered retained candidates must be measured")
+        precondition(postPlanPreview.items.first { $0.url.path == hidden.path }?.allocatedSize != nil, "covered candidate size must be present")
+        precondition(postPlanPreview.items.first { $0.url.path == visible.path }?.allocatedSize != nil, "uncovered candidate size must be measured")
         let results = remover.moveIncludingData(plan: plan, isRunning: { _ in false })
         destinations += results.compactMap(\.destination)
         precondition(results.count == 3 && results.allSatisfy { $0.destination != nil && $0.error == nil }, "home-level removal failed: \(results)")

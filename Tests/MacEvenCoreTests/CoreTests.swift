@@ -195,6 +195,14 @@ func XCTAssertThrowsError(_ body: @autoclosure () throws -> Any, file: StaticStr
 
 @main struct Checks {
     static func main() throws {
+        if CommandLine.arguments.contains("--performance-only") {
+            try TrashTests().testLocalMaintenanceAndQueryPlans()
+            try TrashTests().testNativeTrashAndHardlinkReassignment()
+            try PurposeTests().testScanSummary()
+            try OtherStorageTests().testMeasurementBoundsAndIssues()
+            print("PASS: local index maintenance, hard-link transfer, purpose totals, indexed queries and shared storage traversal")
+            return
+        }
         if CommandLine.arguments.contains("--cache-only") {
             let cache = CacheTests()
             try cache.testMetadataDiscoveryWithoutAppRegistry()
@@ -241,9 +249,10 @@ func XCTAssertThrowsError(_ body: @autoclosure () throws -> Any, file: StaticStr
         let trash = TrashTests()
         try trash.testProtectionAndReplacement()
         try trash.testBlockKindMirrorsCleanupRules()
+        try trash.testLocalMaintenanceAndQueryPlans()
         try trash.testNativeTrashAndHardlinkReassignment()
         try trash.testParentChildAndPartialFailure()
-        print("PASS: 4 trash behavior checks (only generated test files)")
+        print("PASS: 5 trash behavior checks (only generated test files)")
         let cache = CacheTests()
         try cache.testMetadataDiscoveryWithoutAppRegistry()
         try cache.testNamedAndApplicationSupportCaches()

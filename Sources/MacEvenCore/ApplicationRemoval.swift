@@ -280,7 +280,7 @@ public final class ApplicationRemoval {
 
     /// 单个应用的关联数据统计；逐应用检查与批量检测共用，保证同一个应用两处数字一致。
     private func relatedDataPreview(app: InstalledApplication, scratch: DiskIndex, token: CancellationToken,
-                                    cache: ApplicationDataListingCache?) throws -> ApplicationDataPreview {
+                                    cache: ApplicationDataListingCache?, reusing plan: ApplicationDataPlan? = nil) throws -> ApplicationDataPreview {
         var warnings: [String] = []
         let exact: [URL]
         do { exact = try dataCandidates(identifier: app.bundleIdentifier, warnings: &warnings) }
@@ -300,9 +300,16 @@ public final class ApplicationRemoval {
                 }
                 let identity = try FileIdentity.read(candidate.url)
                 if identity.isDirectory {
-                    let summary = try Scanner.scan(root: candidate.url, index: scratch, token: token, resetIndex: false, requireCompleteTraversal: true)
-                    guard !summary.cancelled, summary.errors == 0 else { throw MacEvenError(localized("未完整统计：\(summary.errorExamples.first ?? candidate.url.path)")) }
-                    size = try scratch.entry(id: summary.rootID)?.allocatedSize
+                    if let plan, plan.applicationID == app.id, dataPlans[app.id]?.id == plan.id,
+                       let record = dataRecords[app.id]?.first(where: { $0.url == candidate.url }),
+                       let entry = try? index.entry(id: record.rootID),
+                       entry.identity == identity {
+                        size = entry.allocatedSize
+                    } else {
+                        let summary = try Scanner.scan(root: candidate.url, index: scratch, token: token, resetIndex: false, requireCompleteTraversal: true)
+                        guard !summary.cancelled, summary.errors == 0 else { throw MacEvenError(localized("未完整统计：\(summary.errorExamples.first ?? candidate.url.path)")) }
+                        size = try scratch.entry(id: summary.rootID)?.allocatedSize
+                    }
                 } else { size = identity.allocated }
             } catch { issue = error.localizedDescription }
             issue = issue ?? protectedReason
@@ -313,14 +320,14 @@ public final class ApplicationRemoval {
         return ApplicationDataPreview(applicationID: app.id, items: items, warnings: warnings)
     }
 
-    public func inspectRelatedData(id: String, token: CancellationToken) throws -> ApplicationDataPreview {
+    public func inspectRelatedData(id: String, token: CancellationToken, reusing plan: ApplicationDataPlan? = nil) throws -> ApplicationDataPreview {
         guard !invalid, let app = try refresh(isRunning: { _ in false }).first(where: { $0.id == id }) else { throw MacEvenError(localized("该应用无法检查关联数据。")) }
         if let reason = dataInspectionProtection(app) { throw MacEvenError(reason) }
         let scratchURL = index.url.deletingLastPathComponent().appendingPathComponent("related-data-\(UUID()).sqlite")
         defer { try? FileManager.default.removeItem(at: scratchURL); try? FileManager.default.removeItem(atPath: scratchURL.path + "-journal") }
         let scratch = try DiskIndex(url: scratchURL)
         defer { scratch.close() }
-        return try relatedDataPreview(app: app, scratch: scratch, token: token, cache: nil)
+        return try relatedDataPreview(app: app, scratch: scratch, token: token, cache: nil, reusing: plan)
     }
 
     /// 一次性检测所有可检查应用的关联数据：只读、可取消；跳过或失败的应用不影响其他应用。

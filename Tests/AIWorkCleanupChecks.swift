@@ -376,6 +376,11 @@ import MacEvenCore
         precondition(!smart.aiWorkCleaning)
         precondition(smart.aiWorkSelectedCount > 0, "selection must survive a refused execute")
 
+        // 无关位置在扫描后新增内容，清理会话时不应重新扫描它。
+        let unrelatedID = home.appendingPathComponent(".codex/generated_images").path
+        let unrelatedBefore = smart.aiStorage.first { $0.id == unrelatedID }
+        try write(".codex/generated_images/new.bin")
+
         // 正常执行独立清理
         smart.prepareAIWorkCleanup()
         precondition(smart.aiWorkConfirmation != nil)
@@ -392,6 +397,7 @@ import MacEvenCore
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".claude/projects/project-beta/session_m.jsonl").path), "unselected missing-project session must be preserved")
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".claude/projects/project-beta/memory.md").path), "Beta project memory must be preserved")
         precondition(smart.aiWorkSelectedCount == 0, "executed selection must be pruned to what remains")
+        precondition(smart.aiStorage.first { $0.id == unrelatedID } == unrelatedBefore, "cleanup refreshed an unrelated storage tree")
 
         try write(".codex/sessions/shutdown.jsonl")
         smart.scanAll(); try await wait { smart.phase == .ready }
@@ -428,6 +434,32 @@ import MacEvenCore
             let error: String? = await withCheckedContinuation { c in close { c.resume(returning: $0) } }
             precondition(error == nil)
         }
+
+        precondition(AIWorkActivity.blockedReason(.codex, home.appendingPathComponent("missing-occupancy-target")) != nil,
+                     "an incomplete occupancy query must retain the target")
+
+        let batchHome = home.appendingPathComponent("batch-home")
+        let batchRoot = batchHome.appendingPathComponent(".codex/sessions")
+        try fm.createDirectory(at: batchRoot, withIntermediateDirectories: true)
+        for number in 0..<501 { try Data("{}\n".utf8).write(to: batchRoot.appendingPathComponent("\(number).jsonl")) }
+        let batched = AIWorkCleanup(home: batchHome, protection: ProtectionStore(url: batchHome.appendingPathComponent("protection.json")))
+        for _ in 0..<2 {
+            let batch = try batched.scan()
+            precondition(batch.flatMap(\.targets).count == 501 && batch.reduce(0, { $0 + $1.allocatedSize }) > 0, "transaction boundary lost sessions or retained stale identities")
+        }
+
+        let linkedA = batchRoot.appendingPathComponent("linked-a.jsonl")
+        let linkedB = batchRoot.appendingPathComponent("linked-b.jsonl")
+        try Data("linked\n".utf8).write(to: linkedA)
+        try fm.linkItem(at: linkedA, to: linkedB)
+        let linkedGroups = try batched.scan()
+        let inode = try FileIdentity.read(linkedA).inode
+        let owner = linkedGroups.flatMap(\.targets).first { $0.identity.inode == inode && $0.allocatedSize > 0 }!
+        let movedLink = batched.move(targets: [owner], activity: { _, _ in nil })
+        trash += movedLink.compactMap(\.destination)
+        precondition(movedLink.first?.error == nil)
+        let retainedLink = try batched.remainingGroups(linkedGroups).flatMap(\.targets).filter { $0.identity.inode == inode }
+        precondition(retainedLink.count == 1 && retainedLink[0].allocatedSize > 0, "incremental cleanup lost surviving hard-link allocation")
 
         print("PASS: AI work session files are grouped by age and missing projects, per-item selection, directories and non-jsonl preserved, memory and worktrees protected, model reentrancy prevented")
     }

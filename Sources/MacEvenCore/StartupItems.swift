@@ -74,22 +74,30 @@ public final class StartupItems {
     }
     private let home: URL
     private let roots: [(URL, StartupKind)]
-    private let runner: @Sendable (URL, [String]) throws -> SoftwareCommandResult
+    private let runner: @Sendable (URL, [String], CancellationToken?) throws -> SoftwareCommandResult
     private var records: [String: Record] = [:]
     private let launchctl = URL(fileURLWithPath: "/bin/launchctl")
     private var domain: String { "gui/\(getuid())" }
     public init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         systemRoots: [(URL, StartupKind)]? = nil,
-        runner: @escaping @Sendable (URL, [String]) throws -> SoftwareCommandResult = { try SoftwareCommand.run($0, arguments: $1) }
+        runner: (@Sendable (URL, [String]) throws -> SoftwareCommandResult)? = nil,
+        cancellableRunner: (@Sendable (URL, [String], CancellationToken?) throws -> SoftwareCommandResult)? = nil
     ) {
         self.home = (try? canonicalFileURL(home)) ?? home
         self.roots = (systemRoots ?? [(URL(fileURLWithPath: "/Library/LaunchAgents"), .systemAgent), (URL(fileURLWithPath: "/Library/LaunchDaemons"), .systemDaemon)]).map { ((try? canonicalFileURL($0.0)) ?? $0.0, $0.1) }
-        self.runner = runner
+        if let cancellableRunner {
+            self.runner = cancellableRunner
+        } else if let runner {
+            self.runner = { exec, args, _ in try runner(exec, args) }
+        } else {
+            self.runner = { try SoftwareCommand.run($0, arguments: $1, token: $2) }
+        }
     }
 
-    private func disabledState(_ target: String? = nil) throws -> [String: Bool] {
-        let result = try runner(launchctl, ["print-disabled", target ?? domain])
+    private func disabledState(_ target: String? = nil, token: CancellationToken? = nil) throws -> [String: Bool] {
+        if token?.isCancelled == true { throw MacEvenError(localized("检查已取消。")) }
+        let result = try runner(launchctl, ["print-disabled", target ?? domain], token)
         let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.status == 0, output.hasPrefix("disabled services = {"), output.hasSuffix("}") else { throw MacEvenError(localized("无法核验启动许可，状态未知。")) }
         let body = output.dropFirst("disabled services = {".count).dropLast()
@@ -105,8 +113,9 @@ public final class StartupItems {
         }
         return map
     }
-    private func runningState() throws -> [String: Bool] {
-        let result = try runner(launchctl, ["list"])
+    private func runningState(token: CancellationToken? = nil) throws -> [String: Bool] {
+        if token?.isCancelled == true { throw MacEvenError(localized("检查已取消。")) }
+        let result = try runner(launchctl, ["list"], token)
         let lines = result.output.split(separator: "\n")
         guard result.status == 0, lines.first?.split(whereSeparator: { $0.isWhitespace }).map(String.init) == ["PID", "Status", "Label"] else { throw MacEvenError(localized("运行状态不可核验。")) }
         var map: [String: Bool] = [:]
@@ -237,12 +246,12 @@ public final class StartupItems {
         let item = StartupItem(id: url.path, url: url, label: label, program: program, kind: kind, blockedReason: reason, identity: identity, appName: appName, appURL: appURL)
         return Record(item: item, ancestors: parents, defaultDisabled: plist["Disabled"] as? Bool ?? false)
     }
-    private func query(_ record: Record, disabled: [String: Bool]?, running: [String: Bool]?) -> StartupItem {
+    private func query(_ record: Record, disabled: [String: Bool]?, running: [String: Bool]?, token: CancellationToken? = nil) -> StartupItem {
         var item = record.item
         item.enabled = disabled.map { !($0[item.label] ?? record.defaultDisabled) }
         if SMAppService.statusForLegacyPlist(at: item.url) == .requiresApproval { item.enabled = false; item.blockedReason = localized("系统要求用户批准，请在系统设置管理。") }
         let target = (item.kind == .systemDaemon ? "system" : domain) + "/" + item.label
-        if let result = try? runner(launchctl, ["print", target]) { item.loaded = result.status == 0 ? true : result.status == 113 ? false : nil }
+        if let result = try? runner(launchctl, ["print", target], token) { item.loaded = result.status == 0 ? true : result.status == 113 ? false : nil }
         if let running {
             item.running = item.kind == .systemDaemon ? (item.loaded == false ? false : nil) : running[item.label] ?? (item.loaded == false ? false : nil)
         }
@@ -250,7 +259,8 @@ public final class StartupItems {
         return item
     }
 
-    private func scanLoginItems() -> [StartupItem] {
+    private func scanLoginItems(token: CancellationToken? = nil) -> [StartupItem] {
+        if token?.isCancelled == true { return [] }
         let script = """
         tell application "System Events"
             set itemNames to name of every login item
@@ -262,11 +272,13 @@ public final class StartupItems {
             return output
         end tell
         """
-        guard let result = try? runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script]),
+        guard let result = try? runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script], token),
               result.status == 0 else { return [] }
+        if token?.isCancelled == true { return [] }
         var items: [StartupItem] = []
         let runningApps = NSWorkspace.shared.runningApplications
         for line in result.output.split(separator: "\n") {
+            if token?.isCancelled == true { break }
             let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
             guard parts.count >= 2 else { continue }
             let name = parts[0].trimmingCharacters(in: .whitespaces)
@@ -299,7 +311,7 @@ public final class StartupItems {
         guard item.kind == .loginItem else { throw MacEvenError(localized("不是系统登录项，无法以此方式移除。")) }
         let safeName = item.label.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "tell application \"System Events\" to delete (every login item whose name is \"\(safeName)\")"
-        let result = try runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script])
+        let result = try runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script], nil)
         guard result.status == 0 else { throw MacEvenError(localized("移除登录项失败：") + result.error) }
     }
 
@@ -308,22 +320,28 @@ public final class StartupItems {
         guard FileManager.default.fileExists(atPath: path) else { throw MacEvenError(localized("应用文件不存在。")) }
         let safePath = path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "tell application \"System Events\" to make new login item at end with properties {path:\"\(safePath)\", hidden:false}"
-        let result = try runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script])
+        let result = try runner(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script], nil)
         guard result.status == 0 else { throw MacEvenError(localized("添加启动项失败：") + result.error) }
     }
 
     public func scan(token: CancellationToken, includeServices: Bool = true) throws -> StartupScanResult {
         records = [:]
-        let loginItems = scanLoginItems()
+        if token.isCancelled {
+            return StartupScanResult(items: [], incomplete: true, errors: [localized("检查已取消。")])
+        }
+        let loginItems = scanLoginItems(token: token)
+        if token.isCancelled {
+            return StartupScanResult(items: loginItems, incomplete: true, errors: [localized("检查已取消。")])
+        }
         guard includeServices else {
             return StartupScanResult(items: loginItems, incomplete: false, errors: [])
         }
         var items: [StartupItem] = [], errors: [String] = [], incomplete = false, seen = 0
         func note(_ text: String) { incomplete = true; if errors.count < 100 { errors.append(String(text.prefix(1000))) } }
         let disabled: [String: Bool]?, systemDisabled: [String: Bool]?, running: [String: Bool]?
-        do { disabled = try disabledState() } catch { disabled = nil; note(error.localizedDescription) }
-        do { systemDisabled = try disabledState("system") } catch { systemDisabled = nil; note(error.localizedDescription) }
-        do { running = try runningState() } catch { running = nil; note(error.localizedDescription) }
+        do { disabled = try disabledState(token: token) } catch { disabled = nil; note(error.localizedDescription) }
+        do { systemDisabled = try disabledState("system", token: token) } catch { systemDisabled = nil; note(error.localizedDescription) }
+        do { running = try runningState(token: token) } catch { running = nil; note(error.localizedDescription) }
         for (directory, kind) in [(home.appendingPathComponent("Library/LaunchAgents"), StartupKind.userAgent)] + roots {
             if token.isCancelled { incomplete = true; break }
             if !FileManager.default.fileExists(atPath: directory.path) { continue }
@@ -336,12 +354,19 @@ public final class StartupItems {
                     guard seen <= 1024 else { note(localized("启动项达到 1024 条上限。")); break }
                     do {
                         var record = try read(url, kind: kind)
-                        record.item = query(record, disabled: kind == .systemDaemon ? systemDisabled : disabled, running: running)
+                        if token.isCancelled { incomplete = true; break }
+                        record.item = query(record, disabled: kind == .systemDaemon ? systemDisabled : disabled, running: running, token: token)
                         records[url.path] = record; items.append(record.item)
                     } catch { note("\(url.path)：\(error.localizedDescription)") }
                 }
             } catch { note(error.localizedDescription) }
             if seen > 1024 { break }
+        }
+        if token.isCancelled {
+            incomplete = true
+            if !errors.contains(localized("检查已取消。")) && errors.count < 100 {
+                errors.append(localized("检查已取消。"))
+            }
         }
         let labels = Dictionary(grouping: items, by: \.label)
         for index in items.indices where (labels[items[index].label]?.count ?? 0) > 1 {
@@ -364,7 +389,7 @@ public final class StartupItems {
         if originalEnabled == enabled { return before }
         let target = domain + "/" + item.label
         func execute(_ args: [String]) throws {
-            let result = try runner(launchctl, args)
+            let result = try runner(launchctl, args, nil)
             guard result.status == 0 else { throw MacEvenError(localized("launchctl 操作失败：") + String(result.error.prefix(1000))) }
         }
         do {

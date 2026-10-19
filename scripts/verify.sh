@@ -49,6 +49,7 @@ bash scripts/check-cache-model.sh
 bash scripts/check-application-model.sh
 bash scripts/check-dock.sh
 bash scripts/check-smart-scan.sh
+bash scripts/check-ai-work-cleanup.sh
 bash scripts/check-cleanup-layout.sh
 bash scripts/check-sidebar-collapse.sh
 bash scripts/check-software.sh
