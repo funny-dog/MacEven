@@ -8,8 +8,7 @@ build/
 *.zip
 *.zip.sha256
 
-# 本地开发与助手配置
-/AGENTS.md
+# 本地开发
 *.log
 
 # 本地凭据与签名私钥
