@@ -10,6 +10,8 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
     // 热门 AI Agent 与编辑器：WorkBuddy, Cursor, Trae, Windsurf, Continue, Devin, Chroma
     case workbuddyLogs, workbuddyCache, workbuddyTraces
     case cursorLogs, traeLogs, windsurfLogs, continueLogs, devinCache, chromaCache
+    // 工具自身 tmp 区的泄漏残留：候选是其下匹配“已知前缀 + 随机/时间戳后缀”且内容长期未动的子目录，不是 tmp 根本身。
+    case codexTmp, codexTmpRoot
     public var name: String {
         switch self {
         case .claudeCache: return localized("Claude Code 更新说明缓存")
@@ -29,6 +31,8 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
         case .continueLogs: return localized("Continue 运行日志")
         case .devinCache: return localized("Devin 运行缓存")
         case .chromaCache: return localized("Chroma 向量模型缓存")
+        case .codexTmp: return localized("Codex 临时区泄漏克隆")
+        case .codexTmpRoot: return localized("Codex 临时目录泄漏残留")
         case .derivedData: return "Xcode DerivedData"
         case .pip: return localized("pip 下载缓存")
         case .npm: return localized("npm 内容缓存")
@@ -51,7 +55,8 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
         case .claudeCache, .claudeDebug, .codexLogs,
              .copilotLogs, .kimiLogs, .kimiCache, .codebuddyLogs, .aiderCache,
              .workbuddyLogs, .workbuddyCache, .workbuddyTraces,
-             .cursorLogs, .traeLogs, .windsurfLogs, .continueLogs, .devinCache, .chromaCache: return "AI Agent"
+             .cursorLogs, .traeLogs, .windsurfLogs, .continueLogs, .devinCache, .chromaCache,
+             .codexTmp, .codexTmpRoot: return "AI Agent"
         case .chrome, .edge, .firefox: return localized("浏览器")
         default: return localized("开发工具")
         }
@@ -72,6 +77,7 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
         case .continueLogs: return "Continue"
         case .devinCache: return "Devin"
         case .chromaCache: return "Chroma"
+        case .codexTmp, .codexTmpRoot: return "Codex"
         default: return nil
         }
     }
@@ -106,6 +112,8 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
         case .cargo: return ".cargo/registry/cache"
         case .deviceSupport: return "Library/Developer/Xcode/iOS DeviceSupport"
         case .simulatorCaches: return "Library/Developer/CoreSimulator/Caches"
+        case .codexTmp: return ".codex/.tmp"
+        case .codexTmpRoot: return ".codex/tmp"
         case .chrome: return "Library/Caches/Google/Chrome"
         case .edge: return "Library/Caches/Microsoft Edge"
         case .firefox: return "Library/Caches/Firefox"
@@ -121,6 +129,8 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
         case .kimiCache, .workbuddyCache, .devinCache, .chromaCache:
             return localized("配置与环境模型缓存可联网重新同步；不涉及会话、记忆与凭据")
         case .aiderCache: return localized("模型价格与上下文信息可联网重新拉取；不涉及会话与配置")
+        case .codexTmp, .codexTmpRoot:
+            return localized("工具升级或克隆留下的临时副本，删除后由工具按需重建；副本内可能有旧项目文件，确认无需保留后再清理")
         case .derivedData: return localized("需要重新构建项目")
         case .pip: return localized("需要网络重新下载依赖；本地构建 wheel 可能需要重新构建")
         case .deviceSupport: return localized("连接设备调试时 Xcode 会重新复制符号文件，耗时较长")
@@ -132,6 +142,31 @@ public enum DeveloperCleanupRule: String, CaseIterable, Sendable {
     }
     /// 整目录移动时内部的符号链接只作为链接移动、从不跟随；仅 Homebrew 缓存按设计含指向自身下载目录的链接。
     var allowsInternalLinks: Bool { self == .homebrew }
+
+    /// 工具 tmp 根规则：扫描其下泄漏子目录而不是 tmp 根；默认不选中、逐项确认。
+    public var isToolTmpRoot: Bool { self == .codexTmp || self == .codexTmpRoot }
+
+    /// 泄漏命名判定：只认登记过的“已知前缀 + 随机/时间戳后缀”，工具自己的稳定工作目录（如 marketplaces）一律不命中。
+    public static func isToolTmpLeakName(_ rule: DeveloperCleanupRule, _ name: String) -> Bool {
+        switch rule {
+        case .codexTmp:
+            // git-XXXXXX：Codex 会话期间创建的裸 git 临时克隆（6 位随机后缀）
+            if name.hasPrefix("git-") {
+                let suffix = name.dropFirst(4)
+                if suffix.count == 6, suffix.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) { return true }
+            }
+            // marketplace-upgrade-*：插件市场升级留下的克隆（后缀为随机串）
+            if name.hasPrefix("marketplace-upgrade-"), name.dropFirst("marketplace-upgrade-".count).count >= 6 { return true }
+            return false
+        case .codexTmpRoot:
+            // <名称>-misplaced-YYYYMMDD-HHMMSS：Codex 移错位置的工作区副本
+            guard let marker = name.range(of: "-misplaced-") else { return false }
+            let parts = name[marker.upperBound...].split(separator: "-")
+            return parts.count == 2 && parts[0].count == 8 && parts[1].count == 6
+                && parts.allSatisfy { $0.allSatisfy(\.isNumber) }
+        default: return false
+        }
+    }
 }
 
 public struct DeveloperCleanupGroup: Identifiable, Sendable, Equatable {
@@ -215,7 +250,7 @@ public enum DeveloperCleanupActivity {
         let names: [String]
         switch rule {
         case .claudeCache, .claudeDebug: names = ["claude"]
-        case .codexLogs: names = ["codex", "codex-exec"]
+        case .codexLogs, .codexTmp, .codexTmpRoot: names = ["codex", "codex-exec"]
         case .copilotLogs: names = ["copilot", "github-copilot"]
         case .kimiLogs, .kimiCache: names = ["kimi-code", "kimi"]
         case .codebuddyLogs: names = ["codebuddy", "CodeBuddy"]
@@ -394,7 +429,9 @@ public final class DeveloperCleanup {
                   ["xcodeproj", "xcworkspace"].contains(URL(fileURLWithPath: workspace).pathExtension),
                   try FileIdentity.read(path.appendingPathComponent("Build")).isDirectory else { throw unknown }
         }
-        if ![.derivedData, .pip, .npm].contains(rule) { try requireMarker(rule, path: path, root: root, unknown: unknown) }
+        if rule.isToolTmpRoot {
+            try validateToolTmpCandidate(rule, path: path, id: id, unknown: unknown)
+        } else if ![.derivedData, .pip, .npm].contains(rule) { try requireMarker(rule, path: path, root: root, unknown: unknown) }
         var count = 0, recognizedFiles = 0
         func visit(_ entry: DiskEntry, depth: Int) throws {
             count += 1
@@ -503,6 +540,24 @@ public final class DeveloperCleanup {
         return suffix.count == 16 && suffix.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } && name[..<dash].contains(".")
     }
 
+    /// 工具 tmp 泄漏候选的三重校验：tmp 根归属（marker）、泄漏命名、内容 mtime 全部超过阈值。
+    /// 命名匹配但内容近期仍在变化的一律保留——工具可能正在使用。
+    static let toolTmpLeakAge: TimeInterval = 14 * 86_400
+    private func validateToolTmpCandidate(_ rule: DeveloperCleanupRule, path: URL, id: Int64, unknown: MacEvenError) throws {
+        // 候选必须直接位于登记的 tmp 根之下。
+        let tmpRoot = home.appendingPathComponent(rule.relativePath)
+        guard path.deletingLastPathComponent().standardizedFileURL.path == tmpRoot.standardizedFileURL.path else { throw unknown }
+        // marker：工具根目录必须有自己的 config.toml，防止同名 tmp 目录被误认。
+        let toolRoot = tmpRoot.deletingLastPathComponent()
+        guard (try? FileIdentity.read(toolRoot.appendingPathComponent("config.toml")))?.isRegular == true else { throw unknown }
+        guard DeveloperCleanupRule.isToolTmpLeakName(rule, path.lastPathComponent) else { throw unknown }
+        // 活跃度只看文件内容 mtime；无文件的空目录回退到目录自身 mtime。
+        let newest = try index.newestModified(inSubtreeOf: id) ?? (try index.entry(id: id))?.identity.modified
+        guard let newest else { throw unknown }
+        let age = Date().timeIntervalSince1970 - Double(newest) / 1_000_000_000
+        guard age >= Self.toolTmpLeakAge else { throw MacEvenError(localized("目录内容在近 \(Int(Self.toolTmpLeakAge / 86_400)) 天内仍有修改，可能仍在使用，已保留。")) }
+    }
+
     /// 每条整目录规则要求根目录直接包含该工具自己的标志，避免同名目录被当作缓存。
     private func requireMarker(_ rule: DeveloperCleanupRule, path: URL, root: DiskEntry, unknown: MacEvenError) throws {
         let children = try index.children(of: root.id, offset: 0, limit: 1000)
@@ -550,6 +605,8 @@ public final class DeveloperCleanup {
         case .chrome, .edge: found = directories.contains { $0 == "Default" || $0.hasPrefix("Profile ") || $0 == "Guest Profile" || $0 == "System Profile" }
         case .firefox: found = directories.contains("Profiles")
         case .derivedData, .pip, .npm: found = true
+        // tmp 泄漏规则不走 requireMarker：归属校验在 validateToolTmpCandidate 里按工具根的 config.toml 判定。
+        case .codexTmp, .codexTmpRoot: found = false
         }
         guard found else { throw unknown }
     }
@@ -574,6 +631,11 @@ public final class DeveloperCleanup {
                 stored.append(Group(id: rule.rawValue, rule: rule, path: path, rootID: nil, ancestors: [:], issue: error.localizedDescription)); continue
             }
             do {
+                if rule.isToolTmpRoot {
+                    // marker：工具根目录必须有自己的 config.toml 才认这个 tmp 区；否则整条规则跳过。
+                    let toolRoot = path.deletingLastPathComponent()
+                    guard (try? FileIdentity.read(toolRoot.appendingPathComponent("config.toml")))?.isRegular == true else { continue }
+                }
                 let snapshots = try ancestors(path)
                 let oldVisited = visited, oldLogical = logical, oldAllocated = allocated, oldErrors = errors
                 let result = try Scanner.scan(root: path, index: index, token: token, resetIndex: false, requireCompleteTraversal: true) { value in
@@ -583,7 +645,23 @@ public final class DeveloperCleanup {
                 guard let root = try index.entry(id: result.rootID) else { throw MacEvenError(localized("扫描索引不完整。")) }
                 logical += root.logicalSize; allocated += root.allocatedSize
                 let issue = result.cancelled || result.errors > 0 ? localized("检查不完整或已取消，禁止清理。") : nil
-                if rule == .derivedData {
+                if rule.isToolTmpRoot {
+                    // 只把“泄漏命名 + 内容超过阈值未动”的直接子目录列为候选；活跃子目录与工具自己的稳定工作目录一律不出现。
+                    var offset = 0
+                    while !token.isCancelled {
+                        let page = try index.children(of: root.id, offset: offset, limit: 100)
+                        for child in page where child.identity.isDirectory {
+                            guard DeveloperCleanupRule.isToolTmpLeakName(rule, child.name) else { continue }
+                            // 活跃度只看文件内容 mtime；无文件的空目录回退到目录自身 mtime。
+                            let newest = try index.newestModified(inSubtreeOf: child.id) ?? child.identity.modified
+                            guard Date().timeIntervalSince1970 - Double(newest) / 1_000_000_000 >= Self.toolTmpLeakAge else { continue }
+                            var childSnapshots = snapshots; childSnapshots[child.url] = child.identity
+                            stored.append(Group(id: "\(rule.rawValue):\(child.name)", rule: rule, path: child.url, rootID: child.id, ancestors: childSnapshots, issue: issue))
+                        }
+                        if page.count < 100 { break }; offset += page.count
+                        if stored.count >= 4096 { errors += 1; examples.append(localized("开发缓存条目达到上限，结果不完整。")); invalid = true; break }
+                    }
+                } else if rule == .derivedData {
                     var offset = 0
                     while !token.isCancelled {
                         let page = try index.children(of: root.id, offset: offset, limit: 100)
@@ -650,6 +728,18 @@ public final class DeveloperCleanup {
             try recheck(stored[position], force: true)
             stored[position].validated = true
         } catch { stored[position].issue = error.localizedDescription; throw error }
+    }
+
+    /// 「查看构成」：从本次扫描索引读取组的直接子项（按占用排序）；只读，不引入新扫描。
+    public func composition(groupID: String, limit: Int = 20) throws -> CleanupComposition? {
+        guard !invalid, let group = stored.first(where: { $0.id == groupID }), let rootID = group.rootID,
+            let root = try index.entry(id: rootID) else { return nil }
+        let total = try index.childCount(of: rootID)
+        let entries = try index.children(of: rootID, offset: 0, limit: max(1, min(limit, 100))).map { child in
+            CleanupCompositionEntry(url: child.url, allocatedSize: child.allocatedSize, isDirectory: child.isDirectory,
+                modifiedAt: Date(timeIntervalSince1970: Double(child.identity.modified) / 1_000_000_000))
+        }
+        return CleanupComposition(root: root.url, entries: entries, totalChildren: total, measuredLive: false)
     }
 
     public func move(groupIDs: [String], activity: (DeveloperCleanupRule, URL) -> String? = DeveloperCleanupActivity.blockedReason) -> [TrashResult] {

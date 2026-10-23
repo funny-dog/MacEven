@@ -176,6 +176,102 @@ import Darwin
         precondition(remaining.allSatisfy { $0.id != "pip" })
         print("PASS: incomplete roots stay blocked without disabling verified roots; only explicit temporary sample moved and index updated")
         try checkWholeDirectoryRules()
+        try checkToolTmpLeakRules()
+    }
+
+    // 工具 tmp 泄漏规则：marker、泄漏命名白名单、内容 mtime 阈值；候选是 tmp 根下的子目录，tmp 根本身与活跃目录绝不出现。
+    static func checkToolTmpLeakRules() throws {
+        let fm = FileManager.default
+        let temporary = fm.temporaryDirectory.appendingPathComponent("MacEven-tmp-leak-checks-\(UUID())")
+        try fm.createDirectory(at: temporary, withIntermediateDirectories: true)
+        let home = try canonicalFileURL(temporary)
+        var trash: [URL] = []
+        defer { for path in trash { try? fm.removeItem(at: path) }; try? fm.removeItem(at: home) }
+        let index = try DiskIndex(url: home.appendingPathComponent("index.sqlite"))
+        defer { index.close() }
+        @discardableResult func file(_ relative: String, _ data: Data = Data(repeating: 7, count: 1024), modified: Date? = nil) throws -> URL {
+            let path = home.appendingPathComponent(relative)
+            try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: path)
+            if let modified { try fm.setAttributes([.modificationDate: modified], ofItemAtPath: path.path) }
+            return path
+        }
+        let old = Date(timeIntervalSinceNow: -40 * 86_400)
+        let fresh = Date(timeIntervalSinceNow: -1 * 86_400)
+        // marker：Codex 工具根自己的 config.toml
+        _ = try file(".codex/config.toml", Data("model = \"test\"\n".utf8))
+        // 泄漏 fixture：git-* 老克隆、marketplace-upgrade-*、misplaced 时间戳目录
+        _ = try file(".codex/.tmp/git-oldabc/HEAD", Data("ref\n".utf8), modified: old)
+        _ = try file(".codex/.tmp/git-oldabc/objects/pack/pack.bin", Data(repeating: 1, count: 4096), modified: old)
+        _ = try file(".codex/.tmp/git-fresh6/HEAD", Data("ref\n".utf8), modified: fresh)
+        _ = try file(".codex/.tmp/git-bad/HEAD", Data("ref\n".utf8), modified: old)
+        _ = try file(".codex/.tmp/marketplaces/claude-plugins-official/marker.json", modified: old)
+        _ = try file(".codex/.tmp/marketplace-upgrade-abc123/plugin.bin", Data(repeating: 2, count: 8192), modified: old)
+        _ = try file(".codex/tmp/core-tenantmall-misplaced-20260313-203700/app/main.py", Data(repeating: 3, count: 2048), modified: old)
+        _ = try file(".codex/tmp/path/active.bin", modified: fresh)
+        // 内含符号链接的泄漏目录：只读，不可清理
+        _ = try file(".codex/.tmp/git-linked/HEAD", Data("ref\n".utf8), modified: old)
+        try fm.createSymbolicLink(at: home.appendingPathComponent(".codex/.tmp/git-linked/escape"), withDestinationURL: home)
+
+        precondition(DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "git-oldabc"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "git-abc"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "git-oldabc/inner"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "marketplaces"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "git-oldabc2"))
+        precondition(DeveloperCleanupRule.isToolTmpLeakName(.codexTmp, "marketplace-upgrade-abc123"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmpRoot, "path"))
+        precondition(DeveloperCleanupRule.isToolTmpLeakName(.codexTmpRoot, "core-tenantmall-misplaced-20260313-203700"))
+        precondition(!DeveloperCleanupRule.isToolTmpLeakName(.codexTmpRoot, "notes-misplaced-2026031"))
+        precondition(DeveloperCleanupActivity.processReason(.codexTmp, "/usr/local/bin/codex\n") != nil)
+        precondition(DeveloperCleanupActivity.processReason(.codexTmpRoot, "/usr/bin/vim\n") == nil)
+
+        let cleaner = DeveloperCleanup(index: index, home: home)
+        func scan() throws -> [DeveloperCleanupGroup] {
+            let result = try cleaner.scan(token: CancellationToken())
+            precondition(result.summary.errors == 0 && !result.summary.cancelled, "scan failed: \(result.summary.errorExamples)")
+            return try cleaner.refresh(activity: { _, _ in nil })
+        }
+        let groups = try scan()
+        let leakIDs = Set(groups.filter { $0.rule.isToolTmpRoot }.map(\.id))
+        precondition(leakIDs == Set(["codexTmp:git-oldabc", "codexTmp:marketplace-upgrade-abc123", "codexTmpRoot:core-tenantmall-misplaced-20260313-203700", "codexTmp:git-linked"]),
+            "unexpected tmp leak candidates: \(leakIDs)")
+        for leak in groups.filter({ $0.rule.isToolTmpRoot && $0.id != "codexTmp:git-linked" }) {
+            precondition(leak.blockedReason == nil && leak.allocatedSize! > 0, "\(leak.id): \(leak.blockedReason ?? "unmeasured")")
+        }
+        let linkedGroup = groups.first { $0.id == "codexTmp:git-linked" }
+        precondition(linkedGroup?.blockedReason != nil, "leak with an internal link must stay read-only")
+        let composition = try cleaner.composition(groupID: "codexTmp:marketplace-upgrade-abc123")
+        precondition(composition?.entries.contains { $0.name == "plugin.bin" } == true, "composition must list leak contents")
+        precondition(cleaner.move(groupIDs: ["codexTmp:git-linked"], activity: { _, _ in nil }).allSatisfy { $0.destination == nil && $0.error != nil })
+
+        // 执行：泄漏目录移到废纸篓；tmp 根、活跃目录、工具根与配置全部保留
+        let moved = cleaner.move(groupIDs: ["codexTmp:git-oldabc", "codexTmpRoot:core-tenantmall-misplaced-20260313-203700"], activity: { _, _ in nil })
+        trash += moved.compactMap(\.destination)
+        precondition(moved.count == 2 && moved.allSatisfy { $0.destination != nil && $0.error == nil }, "\(moved.map(\.error))")
+        precondition(!fm.fileExists(atPath: home.appendingPathComponent(".codex/.tmp/git-oldabc").path))
+        precondition(!fm.fileExists(atPath: home.appendingPathComponent(".codex/tmp/core-tenantmall-misplaced-20260313-203700").path))
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/.tmp").path), "tmp root itself must never move")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/tmp").path))
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/.tmp/git-fresh6/HEAD").path), "freshly modified git scratch must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/.tmp/git-bad/HEAD").path), "unknown naming must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/.tmp/marketplaces").path), "stable tool work directory must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/tmp/path/active.bin").path), "active tmp content must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/config.toml").path), "tool root config must be preserved")
+
+        // marker 缺失：没有 config.toml 的工具根完全不产生候选
+        let aliasHome = home.appendingPathComponent("alias-home")
+        try fm.createDirectory(at: aliasHome.appendingPathComponent(".codex/.tmp/git-oldabc/objects"), withIntermediateDirectories: true)
+        try Data("ref\n".utf8).write(to: aliasHome.appendingPathComponent(".codex/.tmp/git-oldabc/HEAD"))
+        try fm.setAttributes([.modificationDate: old], ofItemAtPath: aliasHome.appendingPathComponent(".codex/.tmp/git-oldabc/HEAD").path)
+        let aliasIndex = try DiskIndex(url: aliasHome.appendingPathComponent("index.sqlite"))
+        defer { aliasIndex.close() }
+        let aliasCleaner = DeveloperCleanup(index: aliasIndex, home: aliasHome)
+        let aliasResult = try aliasCleaner.scan(token: CancellationToken())
+        precondition(aliasResult.summary.errors == 0)
+        let aliasGroups = try aliasCleaner.refresh(activity: { _, _ in nil })
+        precondition(aliasGroups.allSatisfy { !$0.rule.isToolTmpRoot }, "missing tool marker must skip the whole tmp rule")
+        aliasIndex.close()
+        print("PASS: tool tmp leak rules with markers, naming whitelist, content mtime threshold and tmp-root protection")
     }
 
     // 0.15 整目录规则：有标志才可选；标志缺失、链接（Homebrew 内部链接除外）、未知 Cargo 内容只读；

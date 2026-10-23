@@ -177,6 +177,26 @@ public final class CacheCleanup {
         return values.sorted { ($0.allocatedSize ?? -1) == ($1.allocatedSize ?? -1) ? $0.id < $1.id : ($0.allocatedSize ?? -1) > ($1.allocatedSize ?? -1) }
     }
 
+    /// 「查看构成」：从本次扫描索引读取缓存组的直接子项（按占用排序）；只读，不引入新扫描。
+    /// 一个应用可对应多个缓存根，构成是各根直接子项的合并清单。
+    public func composition(groupID: String, limit: Int = 20) throws -> CleanupComposition? {
+        guard !indexInvalid, let group = stored.first(where: { $0.id == groupID }), !group.roots.isEmpty,
+            let root = group.paths.first else { return nil }
+        var entries: [CleanupCompositionEntry] = []
+        var total = 0
+        for rootID in group.roots {
+            guard try index.entry(id: rootID) != nil else { continue }
+            total += try index.childCount(of: rootID)
+            entries += try index.children(of: rootID, offset: 0, limit: max(1, min(limit, 100))).map { child in
+                CleanupCompositionEntry(url: child.url, allocatedSize: child.allocatedSize, isDirectory: child.isDirectory,
+                    modifiedAt: Date(timeIntervalSince1970: Double(child.identity.modified) / 1_000_000_000))
+            }
+        }
+        guard !entries.isEmpty else { return nil }
+        entries.sort { $0.allocatedSize != $1.allocatedSize ? $0.allocatedSize > $1.allocatedSize : $0.id < $1.id }
+        return CleanupComposition(root: root, entries: Array(entries.prefix(limit)), totalChildren: total, measuredLive: false)
+    }
+
     public func rescanAfterQuit(groupID: String, token: CancellationToken, isRunning: (String) -> Bool) throws {
         guard !indexInvalid, let position = stored.firstIndex(where: { $0.id == groupID }), stored[position].issue == nil,
             let app = stored[position].app, !stored[position].roots.isEmpty, !isRunning(app.id) else { throw MacEvenError(localized("应用尚未退出或缓存不可清理，内容已保留。")) }

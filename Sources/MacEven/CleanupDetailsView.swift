@@ -138,6 +138,7 @@ struct CleanupRestrictionsSection: View {
 struct AppCacheDetailsView: View {
     @ObservedObject var cache: CacheModel
     @Environment(\.advancedMode) private var advanced
+    @StateObject private var compositionPresenter = CleanupCompositionPresenter()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -247,6 +248,9 @@ struct AppCacheDetailsView: View {
                             .truncationMode(.middle)
                             .textSelection(.enabled)
                         Spacer()
+                        if path == group.paths.first {
+                            CompositionButton(label: localized("查看构成"), provider: { await cache.composition(of: group) }, presenter: compositionPresenter)
+                        }
                         Button(localized("在 Finder 查看")) {
                             NSWorkspace.shared.activateFileViewerSelecting([path])
                         }
@@ -266,6 +270,7 @@ struct AppCacheDetailsView: View {
 struct DeveloperCacheDetailsView: View {
     @ObservedObject var model: DeveloperCleanupModel
     @Environment(\.advancedMode) private var advanced
+    @StateObject private var compositionPresenter = CleanupCompositionPresenter()
 
     /// 明细与卡片口径一致：这里只列开发与浏览器缓存，AI Agent 缓存在「AI 清理与维护」中逐项确认。
     private var groups: [DeveloperCleanupGroup] { model.groups.filter { $0.rule.aiToolName == nil } }
@@ -382,6 +387,7 @@ struct DeveloperCacheDetailsView: View {
                             .truncationMode(.middle)
                             .textSelection(.enabled)
                         Spacer()
+                        CompositionButton(label: localized("查看构成"), provider: { await model.composition(of: group) }, presenter: compositionPresenter)
                         Button(localized("在 Finder 查看")) {
                             NSWorkspace.shared.activateFileViewerSelecting([path])
                         }

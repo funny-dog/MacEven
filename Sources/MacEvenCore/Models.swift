@@ -131,3 +131,31 @@ public struct ScanSummary: Sendable {
         self.filteredShared = filteredShared
     }
 }
+
+/// 清理组「查看构成」的直接子项：聚合大小背后装了什么，两步内可见。只读，不引入新的扫描。
+public struct CleanupCompositionEntry: Identifiable, Sendable, Equatable {
+    public var id: String { url.path }
+    public let url: URL
+    public let allocatedSize: Int64
+    public let isDirectory: Bool
+    public let modifiedAt: Date?
+    public init(url: URL, allocatedSize: Int64, isDirectory: Bool, modifiedAt: Date?) {
+        self.url = url; self.allocatedSize = allocatedSize; self.isDirectory = isDirectory; self.modifiedAt = modifiedAt
+    }
+    public var name: String { url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent }
+}
+
+/// 某个清理入口的直接子项构成：来自扫描索引快照，或打开弹层时的实时统计。
+public struct CleanupComposition: Sendable, Equatable {
+    public let root: URL
+    public let entries: [CleanupCompositionEntry]
+    /// 根目录的直接子项总数；entries 是按占用排序的前若干项。
+    public let totalChildren: Int
+    /// true 表示实时统计（父级没有扫描索引可用）；false 表示取自本次扫描的索引快照。
+    public let measuredLive: Bool
+    /// 统计中断或部分失败的原因；为 nil 时 entries 完整可信。
+    public let issue: String?
+    public init(root: URL, entries: [CleanupCompositionEntry], totalChildren: Int, measuredLive: Bool, issue: String? = nil) {
+        self.root = root; self.entries = entries; self.totalChildren = totalChildren; self.measuredLive = measuredLive; self.issue = issue
+    }
+}

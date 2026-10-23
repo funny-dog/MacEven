@@ -608,6 +608,23 @@ extension AIStorageConfirmation {
         }
     }
 
+    // MARK: - 「查看构成」（聚合大小的直接子项，只读）
+
+    /// 会话与工作记录目录型候选的构成：来自 AI 清理的扫描索引快照。
+    func aiWorkComposition(of target: AIWorkCleanupTarget) async -> CleanupComposition? {
+        guard target.identity.isDirectory else { return nil }
+        let cleanup = aiCleanup
+        return await Task.detached(priority: .utility) { try? cleanup.composition(of: target) }.value
+    }
+
+    /// 工作资料与记忆没有扫描索引，打开弹层时实时统计一级子项（目录子项逐个完整测量）。
+    func aiStorageComposition(of item: StorageMeasurement) async -> CleanupComposition? {
+        let location = item.location
+        return await Task.detached(priority: .utility) { () -> CleanupComposition? in
+            OtherStorage.composition(of: location, token: CancellationToken())
+        }.value
+    }
+
     private func applyStorageMeasurements(_ measurements: [StorageMeasurement]) {
         let ordinary = Set(OtherStorage.locations(home: home).map(\.id))
         let unique = Dictionary(measurements.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).values

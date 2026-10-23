@@ -64,6 +64,17 @@ import MacEvenCore
         try write(".claude/projects/project-alpha/subagents/agent_1.jsonl", Data("{\"cwd\":\"\(liveProject.path)\",\"sub\":\"agent\"}\n".utf8), modified: recent)
         try write(".claude/file-history/snapshot_1.txt")
         try write(".claude/plans/plan_1.md")
+        // Antigravity：会话数据库（.db）逐项分层；brain、汇总库与非会话文件绝不进入候选。
+        try write(".gemini/antigravity/conversations/0b0ee000-old-0000-0000-000000000000.db", session(liveProject.path), modified: old)
+        try write(".gemini/antigravity/conversations/0b0ee000-fresh-0000-0000-000000000000.db", session(liveProject.path), modified: recent)
+        try write(".gemini/antigravity-cli/conversations/0b0ee000-cli0-0000-0000-000000000000.db", session(liveProject.path), modified: old.addingTimeInterval(3600))
+        try write(".gemini/antigravity/conversations/summary-notes.txt", Data("not a session".utf8), modified: old)
+        try write(".gemini/antigravity/conversation_summaries.db", Data("index".utf8), modified: old)
+        try write(".gemini/antigravity/brain/knowledge/entry.bin", Data("brain".utf8), modified: old)
+        try write(".gemini/history/memory/keep.md", Data("memory".utf8), modified: old)
+        let antOld = home.appendingPathComponent(".gemini/antigravity/conversations/0b0ee000-old-0000-0000-000000000000.db")
+        let antFresh = home.appendingPathComponent(".gemini/antigravity/conversations/0b0ee000-fresh-0000-0000-000000000000.db")
+        let antCliOld = home.appendingPathComponent(".gemini/antigravity-cli/conversations/0b0ee000-cli0-0000-0000-000000000000.db")
 
         let protection = ProtectionStore(url: home.appendingPathComponent("protection.json"))
         let cleanup = AIWorkCleanup(home: home, protection: protection)
@@ -84,18 +95,22 @@ import MacEvenCore
         precondition(scannedPaths.contains(archivedCodex.path))
         precondition(scannedPaths.contains(claudeSession.path))
         precondition(scannedPaths.contains(claudeSubagent.path))
+        precondition(scannedPaths.contains(antOld.path) && scannedPaths.contains(antCliOld.path), "antigravity session databases must be candidates")
         precondition(scannedPaths.contains(home.appendingPathComponent(".claude/file-history").path))
         precondition(scannedPaths.contains(home.appendingPathComponent(".claude/plans").path))
 
-        // 断言：会话目录本身、非 .jsonl 文件、混合根目录都不是候选
+        // 断言：会话目录本身、非会话文件、汇总库与混合根目录都不是候选
         for forbidden in [".codex/sessions", ".codex/archived_sessions", ".claude/projects", ".claude/projects/project-alpha",
-                          ".claude", ".codex", ".codex/sessions/2026/01/02/notes.txt", ".codex/sessions/legacy.json"] {
+                          ".claude", ".codex", ".codex/sessions/2026/01/02/notes.txt", ".codex/sessions/legacy.json",
+                          ".gemini", ".gemini/antigravity", ".gemini/antigravity-cli", ".gemini/antigravity/conversations",
+                          ".gemini/antigravity/conversations/summary-notes.txt", ".gemini/antigravity/conversation_summaries.db"] {
             precondition(!scannedPaths.contains(home.appendingPathComponent(forbidden).path), "\(forbidden) must not be a candidate")
         }
 
-        // 断言：长期记忆、配置、凭据与源码/工作树绝不包含在扫描结果中
+        // 断言：长期记忆、brain、配置、凭据与源码/工作树绝不包含在扫描结果中
         precondition(!scannedPaths.contains(where: { $0.contains("memory") }))
         precondition(!scannedPaths.contains(where: { $0.contains("memories") }))
+        precondition(!scannedPaths.contains(where: { $0.contains("/brain") }))
         precondition(!scannedPaths.contains(where: { $0.contains("worktrees") }))
         precondition(!scannedPaths.contains(where: { $0.contains("config") }))
         precondition(!scannedPaths.contains(where: { $0.contains("credentials") }))
@@ -112,32 +127,53 @@ import MacEvenCore
         // ==========================================
         let targets = scanned.flatMap(\.targets)
         guard let oldTarget = targets.first(where: { $0.url == oldCodex }), let freshTarget = targets.first(where: { $0.url == freshCodex }),
-              let archivedTarget = targets.first(where: { $0.url == archivedCodex }), let claudeTarget = targets.first(where: { $0.url == claudeSession }) else {
+              let archivedTarget = targets.first(where: { $0.url == archivedCodex }), let claudeTarget = targets.first(where: { $0.url == claudeSession }),
+              let antTarget = targets.first(where: { $0.url == antOld }) else {
             fatalError("session targets missing")
         }
         precondition(oldTarget.projectPath == liveProject.path && oldTarget.projectName == "live-project" && !oldTarget.projectMissing,
                      "live project must be recognized")
         precondition(archivedTarget.projectMissing && archivedTarget.projectName == "deleted-project", "missing project must be flagged")
         precondition(claudeTarget.projectMissing, "claude session with removed project must be flagged")
+        precondition(antTarget.rule == .antigravitySessions && antTarget.projectName == "live-project" && !antTarget.projectMissing,
+                     "antigravity database sessions must be probed conservatively")
         precondition(oldTarget.modifiedAt.map { abs($0.timeIntervalSince(old)) < 5 } == true, "modification date must reflect the file")
         precondition(freshTarget.modifiedAt.map { abs($0.timeIntervalSince(recent)) < 5 } == true)
+        // 目录型候选暴露内部最新内容 mtime：活跃度看内容而不是目录自身 mtime。
+        let fileHistoryTarget = targets.first { $0.rule == .claudeFileHistory }
+        precondition(fileHistoryTarget?.newestContentModified != nil, "directory targets must expose newest content mtime")
+        if let newest = fileHistoryTarget?.newestContentModified {
+            precondition(abs(newest.timeIntervalSinceNow) < 300, "newest content mtime must reflect the newest child")
+        }
 
         // 分组行：旧会话 / 项目已删除 / 其他会话 / 快照 / 计划；同一记录只出现在一行
         let rows = AICleanupRows.rows(groups: scanned, ageDays: 90, now: Date())
         precondition(rows.map(\.kind) == [.oldSessions, .missingProjectSessions, .recentSessions, .snapshots, .plans], "unexpected row order: \(rows.map(\.kind))")
-        precondition(rows[0].targets.map(\.url) == [oldCodex], "old row must only contain sessions older than the threshold")
+        precondition(Set(rows[0].targets.map(\.url)) == Set([oldCodex, antOld, antCliOld]), "old row must only contain sessions older than the threshold")
         precondition(rows[0].detail.contains("90 天"), rows[0].detail)
         let missingProjectURLs: [URL] = rows[1].targets.map(\.url).sorted { $0.path < $1.path }
         let expectedMissingProjectURLs: [URL] = [archivedCodex, claudeSession].sorted { $0.path < $1.path }
         precondition(missingProjectURLs == expectedMissingProjectURLs, "missing-project row must only contain removed projects")
         let recentURLs: [URL] = rows[2].targets.map(\.url).sorted { $0.path < $1.path }
-        let expectedRecentURLs: [URL] = [freshCodex, claudeSubagent].sorted { $0.path < $1.path }
+        let expectedRecentURLs: [URL] = [freshCodex, claudeSubagent, antFresh].sorted { $0.path < $1.path }
         precondition(recentURLs == expectedRecentURLs)
         precondition(Set(rows.flatMap { $0.targets.map(\.id) }).count == rows.flatMap(\.targets).count, "rows must not overlap")
         // 阈值放宽后旧会话并入“其他会话”，勾选仍然有效
         let widened = AICleanupRows.rows(groups: scanned, ageDays: 365, now: Date())
         precondition(widened.first(where: { $0.kind == .oldSessions }) == nil, "old row must disappear with a wider threshold")
-        precondition(widened.first(where: { $0.kind == .recentSessions })?.targets.count == 3)
+        precondition(widened.first(where: { $0.kind == .recentSessions })?.targets.count == 6)
+        // brain 知识库即使手工构造目标也必须被安全校验拒绝
+        do {
+            try cleanup.validateSafety(home.appendingPathComponent(".gemini/antigravity/brain"), rule: .antigravitySessions)
+            preconditionFailure("brain path must be rejected by validateSafety")
+        } catch { precondition(error.localizedDescription.contains("brain"), error.localizedDescription) }
+        // 「查看构成」：目录型候选从扫描索引读取直接子项，只读、不重新扫描
+        let compositionTarget = scanned.flatMap(\.targets).first { $0.rule == .claudeFileHistory }
+        let composition = try cleanup.composition(of: compositionTarget!)
+        precondition(composition?.root == home.appendingPathComponent(".claude/file-history"), "composition root mismatch")
+        precondition(composition?.entries.contains { $0.name == "snapshot_1.txt" } == true, "composition must list direct children")
+        let fileComposition = try cleanup.composition(of: targets.first { $0.url == oldCodex }!)
+        precondition(fileComposition == nil, "file targets have no composition")
         // 无法解析元数据的会话保持保守：不进入“项目已删除”，仍属于普通会话行
         let unparsable = home.appendingPathComponent(".codex/sessions/2026/09/30/rollout-broken.jsonl")
         try write(".codex/sessions/2026/09/30/rollout-broken.jsonl", Data("not json at all\n".utf8), modified: recent)
@@ -275,11 +311,18 @@ import MacEvenCore
         precondition(!fm.fileExists(atPath: archivedCodex.path))
         precondition(!fm.fileExists(atPath: claudeSession.path))
         precondition(!fm.fileExists(atPath: claudeSubagent.path))
+        precondition(!fm.fileExists(atPath: antOld.path) && !fm.fileExists(atPath: antCliOld.path) && !fm.fileExists(atPath: antFresh.path),
+                     "antigravity session databases must be moved with their groups")
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/sessions").path), "session directory itself must be preserved")
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/sessions/2026/01/02/notes.txt").path), "non-session files must be preserved")
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/sessions/legacy.json").path), "non-jsonl files must be preserved")
         precondition(!fm.fileExists(atPath: home.appendingPathComponent(".claude/file-history").path))
         precondition(!fm.fileExists(atPath: home.appendingPathComponent(".claude/plans").path))
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".gemini/antigravity/conversations").path), "antigravity conversations directory itself must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".gemini/antigravity/conversations/summary-notes.txt").path), "non-db files must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".gemini/antigravity/conversation_summaries.db").path), "summary index must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".gemini/antigravity/brain/knowledge/entry.bin").path), "brain must be preserved")
+        precondition(fm.fileExists(atPath: home.appendingPathComponent(".gemini/history/memory/keep.md").path), "gemini history memory must be preserved")
 
         // 验证受保护的记忆、配置与源码/工作树完好无损！
         precondition(fm.fileExists(atPath: home.appendingPathComponent(".codex/memories/memory_1.json").path))

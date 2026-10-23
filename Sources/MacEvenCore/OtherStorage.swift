@@ -71,7 +71,7 @@ public enum OtherStorage {
             (localized("Cursor 工作资料"), ".cursor", localized("包含扩展、配置与 Agent 数据，保留并在 Cursor 中管理。")),
             (localized("Trae 工作资料"), ".trae", localized("包含扩展、会话与项目工作资料，保留并在 Trae 中管理。")),
             (localized("WorkBuddy 工作资料"), ".workbuddy", localized("包含会话、记忆、项目历史、配置与工作树数据，保留并在 WorkBuddy 中管理。")),
-            (localized("Gemini / Antigravity 工作资料"), ".gemini", localized("可能由多个工具共享，包含会话、配置与产物，保留。")),
+            (localized("Gemini / Antigravity 工作资料"), ".gemini", localized("brain 知识库、长期记忆与配置明确保留；会话数据库（conversations 下的 .db）可在 AI 工作资料卡片中独立确认清理。")),
             (localized("Kimi Code 工作资料"), ".kimi-code", localized("包含会话、记忆、凭据与配置，保留并通过 Kimi Code 管理。")),
             (localized("GitHub Copilot 工作资料"), ".copilot", localized("包含认证信息、技能与配置，保留。")),
             (localized("CodeBuddy 工作资料"), ".codebuddy", localized("包含诊断与配置，保留。")),
@@ -109,6 +109,47 @@ public enum OtherStorage {
         } }
         let ids = Set(affected.map(\.id))
         return (previous.filter { !ids.contains($0.id) } + measure(affected, token: token)).sorted { $0.allocatedSize > $1.allocatedSize }
+    }
+
+    /// 「查看构成」的实时统计：这些位置没有扫描索引，打开弹层时枚举一级子项并逐个测量目录子项。
+    /// 只读；目录子项的统计是不跟随链接、不进其他卷的完整遍历。
+    public static func composition(of location: StorageLocation, token: CancellationToken,
+                                   limit: Int = 20, progress: @Sendable (Int, Int) -> Void = { _, _ in }) -> CleanupComposition? {
+        let root: FileIdentity
+        do { root = try FileIdentity.read(location.url) } catch { return nil }
+        guard root.isDirectory, !root.isSymlink else { return nil }
+        guard let enumerator = FileManager.default.enumerator(at: location.url, includingPropertiesForKeys: [],
+            options: [.skipsSubdirectoryDescendants], errorHandler: { _, _ in true }) else { return nil }
+        var children: [URL] = []
+        while !token.isCancelled, let url = autoreleasepool(invoking: { enumerator.nextObject() as? URL }) {
+            if children.count >= 4096 { break }
+            children.append(url)
+        }
+        let total = children.count
+        var entries: [CleanupCompositionEntry] = []
+        var denied = 0
+        for (offset, url) in children.enumerated() {
+            if token.isCancelled { break }
+            progress(offset + 1, total)
+            guard let info = try? FileIdentity.read(url) else { denied += 1; continue }
+            if info.isSymlink { continue }
+            if info.isDirectory {
+                // 位置自己的名字与说明在弹层已展示；子项用路径名。
+                let child = StorageLocation(name: url.lastPathComponent, url: url, note: "")
+                guard let measured = measure(child, token: token, limit: 2_000_000), measured.issue == nil else { denied += 1; continue }
+                entries.append(CleanupCompositionEntry(url: url, allocatedSize: measured.allocatedSize, isDirectory: true,
+                    modifiedAt: Date(timeIntervalSince1970: Double(info.modified) / 1_000_000_000)))
+            } else {
+                entries.append(CleanupCompositionEntry(url: url, allocatedSize: info.allocated, isDirectory: false,
+                    modifiedAt: Date(timeIntervalSince1970: Double(info.modified) / 1_000_000_000)))
+            }
+        }
+        guard !entries.isEmpty else { return nil }
+        entries.sort { $0.allocatedSize != $1.allocatedSize ? $0.allocatedSize > $1.allocatedSize : $0.id < $1.id }
+        var issue: String?
+        if token.isCancelled { issue = localized("统计已取消，结果不完整。") }
+        else if denied > 0 { issue = localized("\(denied) 个子项无法统计（可能需要完全磁盘访问权限），合计偏小。") }
+        return CleanupComposition(root: location.url, entries: Array(entries.prefix(limit)), totalChildren: total, measuredLive: true, issue: issue)
     }
 
     /// 不跟随符号链接、不进入其他卷，最多统计 limit 个条目；位置不存在返回 nil。

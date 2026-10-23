@@ -132,12 +132,12 @@ public final class TrashService {
         self.cacheApplications = (cacheApplications + cacheBundleIdentifiers.map { CacheApplication(id: $0, name: $0) }).filter {
             validCacheIdentifier($0.id) && !$0.id.lowercased().hasPrefix("com.apple.") && !$0.id.lowercased().hasPrefix("local.maceven") && $0.id.lowercased() != "maceven"
         }
-        // 只放行固定规则的根目录；DerivedData 只放行其中的单个项目目录。
+        // 只放行固定规则的根目录；DerivedData 与工具 tmp 泄漏只放行其中的单个子目录。
         let home = self.home
         let filteredRoots = developerAllowedRoots.filter { root in
             DeveloperCleanupRule.allCases.contains { rule in
                 let base = home.appendingPathComponent(rule.relativePath).path
-                return rule == .derivedData ? root.deletingLastPathComponent().path == base : root.path == base
+                return rule == .derivedData || rule.isToolTmpRoot ? root.deletingLastPathComponent().path == base : root.path == base
             }
         }
         self.developerRoots = filteredRoots

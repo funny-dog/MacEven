@@ -215,6 +215,20 @@ struct CacheConfirmation: Identifiable, Equatable {
         }
     }
     func isApplicationRunning(_ id: String) -> Bool { isRunning(id) }
+
+    /// 「查看构成」：在索引队列上读取缓存组的直接子项构成；只读，不引入新扫描。
+    func composition(of group: CacheGroup) async -> CleanupComposition? {
+        guard !closed else { return nil }
+        let backend = backend
+        return await withCheckedContinuation { continuation in
+            backend.disk.queue.async {
+                var result: CleanupComposition?
+                if let cleaner = backend.cleaner { result = try? cleaner.composition(groupID: group.id) }
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
     func prepareCleanup() { guard canClean else { return }; confirmation = CacheConfirmation(generation: generation, groups: selectedGroups) }
     func dismissConfirmation() { confirmation = nil }
     func executeCleanup() {
@@ -465,6 +479,20 @@ struct DeveloperCleanupConfirmation: Identifiable, Equatable {
     }
     func prepareCleanup() { guard canClean else { return }; confirmation = DeveloperCleanupConfirmation(generation: generation, groups: selectedGroups) }
     func dismissConfirmation() { confirmation = nil }
+
+    /// 「查看构成」：在索引队列上读取开发缓存组的直接子项构成；只读，不引入新扫描。
+    func composition(of group: DeveloperCleanupGroup) async -> CleanupComposition? {
+        guard !closed else { return nil }
+        let backend = backend
+        return await withCheckedContinuation { continuation in
+            backend.disk.queue.async {
+                var result: CleanupComposition?
+                if let cleaner = backend.cleaner { result = try? cleaner.composition(groupID: group.id) }
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
     func executeCleanup() {
         guard !closed, !busy, !otherBusy(), !scanFailed, let frozen = confirmation, frozen.generation == generation else { return }
         confirmation = nil; operating = true; status = localized("正在移到废纸篓…")

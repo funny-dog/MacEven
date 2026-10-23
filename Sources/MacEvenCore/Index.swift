@@ -141,6 +141,28 @@ public final class DiskIndex {
         try rows("SELECT \(columns) FROM nodes WHERE parent=? ORDER BY allocated DESC,logical DESC,id LIMIT ? OFFSET ?",
             values: [id,Int64(max(0,min(limit,100))),Int64(max(0,offset))])
     }
+
+    public func childCount(of id: Int64) throws -> Int {
+        let stmt = try statement("SELECT COUNT(*) FROM nodes WHERE parent=?")
+        try bind([id], to: stmt)
+        defer { sqlite3_reset(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw failure() }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// 子树内普通文件的最新内容修改时间（st_mtime，纳秒）；目录自身的 mtime 不参与，
+    /// 避免目录条目因创建/改名而更新掩盖内容实际已陈旧。子树没有普通文件时返回 nil。
+    public func newestModified(inSubtreeOf id: Int64) throws -> Int64? {
+        let stmt = try statement("""
+            WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT nodes.id FROM nodes JOIN tree ON nodes.parent=tree.id)
+            SELECT MAX(modified) FROM nodes JOIN tree USING(id) WHERE (mode & 61440)=32768
+            """)
+        try bind([id], to: stmt)
+        defer { sqlite3_reset(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw failure() }
+        guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+        return sqlite3_column_int64(stmt, 0)
+    }
     public func largestFiles(limit: Int = 100, offset: Int = 0) throws -> [DiskEntry] {
         try execute("CREATE INDEX IF NOT EXISTS file_ranking ON nodes(allocated DESC,logical DESC,id) WHERE (mode & 61440)=32768 AND duplicate=0")
         return try rows("SELECT \(columns) FROM nodes WHERE (mode & 61440)=32768 AND duplicate=0 ORDER BY allocated DESC,logical DESC,id LIMIT ? OFFSET ?",

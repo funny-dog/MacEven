@@ -8,6 +8,8 @@ public enum AIWorkCleanupRule: String, CaseIterable, Sendable {
     case claudeProjectSessions
     case claudeFileHistory
     case claudePlans
+    case antigravitySessions
+    case antigravityCliSessions
 
     public var title: String {
         switch self {
@@ -16,6 +18,8 @@ public enum AIWorkCleanupRule: String, CaseIterable, Sendable {
         case .claudeProjectSessions: return localized("Claude Code 项目会话")
         case .claudeFileHistory: return localized("Claude Code 文件修改快照")
         case .claudePlans: return localized("Claude Code 任务计划记录")
+        case .antigravitySessions: return localized("Antigravity 会话数据库")
+        case .antigravityCliSessions: return localized("Antigravity CLI 会话数据库")
         }
     }
 
@@ -26,6 +30,8 @@ public enum AIWorkCleanupRule: String, CaseIterable, Sendable {
         case .claudeProjectSessions: return ".claude/projects"
         case .claudeFileHistory: return ".claude/file-history"
         case .claudePlans: return ".claude/plans"
+        case .antigravitySessions: return ".gemini/antigravity/conversations"
+        case .antigravityCliSessions: return ".gemini/antigravity-cli/conversations"
         }
     }
 
@@ -41,15 +47,25 @@ public enum AIWorkCleanupRule: String, CaseIterable, Sendable {
             return localized("Claude Code 文件修改历史与快照将被清除，后续无法通过快照回滚代码编辑。")
         case .claudePlans:
             return localized("Claude Code 任务计划记录将被清除，后续无法回顾历史任务规划。")
+        case .antigravitySessions, .antigravityCliSessions:
+            return localized("Antigravity 会话数据库将被清除，对应对话历史无法再打开；brain、记忆与配置完整保留。")
         }
     }
 
-    /// 会话文件类规则：候选为会话目录下的单个 .jsonl 文件，可按时间与来源逐项确认。
+    /// 会话文件类规则：候选为会话目录下的单个会话文件（.jsonl 或会话 .db），可按时间与来源逐项确认。
     /// 这些规则绝不允许把父目录本身作为候选。
     public var isSessionFile: Bool {
         switch self {
-        case .codexSessions, .codexArchivedSessions, .claudeProjectSessions: return true
+        case .codexSessions, .codexArchivedSessions, .claudeProjectSessions, .antigravitySessions, .antigravityCliSessions: return true
         case .claudeFileHistory, .claudePlans: return false
+        }
+    }
+
+    /// 会话文件扩展名：Antigravity 会话是单个 SQLite 数据库（.db），Codex/Claude 是 .jsonl。
+    var sessionFileExtension: String {
+        switch self {
+        case .antigravitySessions, .antigravityCliSessions: return "db"
+        default: return "jsonl"
         }
     }
 
@@ -57,18 +73,21 @@ public enum AIWorkCleanupRule: String, CaseIterable, Sendable {
         switch self {
         case .codexSessions, .codexArchivedSessions: return .codex
         case .claudeProjectSessions, .claudeFileHistory, .claudePlans: return .claude
+        case .antigravitySessions, .antigravityCliSessions: return .antigravity
         }
     }
 }
 
 public enum AIWorkTool: String, Sendable, CaseIterable {
     case codex
+    case antigravity
     case claude
 
     public var displayName: String {
         switch self {
         case .codex: return "Codex"
         case .claude: return "Claude Code"
+        case .antigravity: return "Antigravity"
         }
     }
 
@@ -76,6 +95,7 @@ public enum AIWorkTool: String, Sendable, CaseIterable {
         switch self {
         case .codex: return ["codex", "codex-exec"]
         case .claude: return ["claude"]
+        case .antigravity: return ["Antigravity", "antigravity"]
         }
     }
 }
@@ -166,9 +186,12 @@ public struct AIWorkCleanupTarget: Identifiable, Sendable, Equatable {
     public let projectName: String?
     /// 扫描时项目文件夹已不存在；无法确认时为 false。
     public let projectMissing: Bool
+    /// 目录型候选内部最新的内容修改时间（活跃度看内容而不是目录自身 mtime）；单文件候选与未知时为 nil。
+    public let newestContentModified: Date?
 
     public init(rule: AIWorkCleanupRule, url: URL, allocatedSize: Int64, identity: FileIdentity, ancestors: [URL: FileIdentity], impact: String,
-                modifiedAt: Date? = nil, projectPath: String? = nil, projectName: String? = nil, projectMissing: Bool = false) {
+                modifiedAt: Date? = nil, projectPath: String? = nil, projectName: String? = nil, projectMissing: Bool = false,
+                newestContentModified: Date? = nil) {
         self.rule = rule
         self.url = url
         self.allocatedSize = allocatedSize
@@ -179,6 +202,7 @@ public struct AIWorkCleanupTarget: Identifiable, Sendable, Equatable {
         self.projectPath = projectPath
         self.projectName = projectName
         self.projectMissing = projectMissing
+        self.newestContentModified = newestContentModified
     }
 }
 
@@ -297,6 +321,8 @@ public final class AIWorkCleanup: @unchecked Sendable {
             home.appendingPathComponent(".trae").path,
             home.appendingPathComponent(".workbuddy").path,
             home.appendingPathComponent(".gemini").path,
+            home.appendingPathComponent(".gemini/antigravity").path,
+            home.appendingPathComponent(".gemini/antigravity-cli").path,
             home.appendingPathComponent(".kimi-code").path,
             home.appendingPathComponent(".copilot").path,
             home.appendingPathComponent(".codebuddy").path,
@@ -316,6 +342,11 @@ public final class AIWorkCleanup: @unchecked Sendable {
             throw MacEvenError(localized("长期记忆受保护，不可清理：\(path)"))
         }
 
+        // 严格保留 brain 知识库（Antigravity 等工具的长期知识索引）
+        if path.lowercased().contains("/brain/") || path.lowercased().hasSuffix("/brain") {
+            throw MacEvenError(localized("brain 知识库受保护，不可清理：\(path)"))
+        }
+
         // 严格保留项目源码与工作树；会话目录也不能作为整体候选
         if path.lowercased().contains("/worktrees/") || path.lowercased().hasSuffix("/worktrees") {
             throw MacEvenError(localized("项目源码与工作树受保护，不可清理：\(path)"))
@@ -333,12 +364,12 @@ public final class AIWorkCleanup: @unchecked Sendable {
 
         switch rule {
         case .codexSessions:
-            try requireSessionFile(url, parts: parts, prefix: [".codex", "sessions"])
+            try requireSessionFile(url, rule: rule, parts: parts, prefix: [".codex", "sessions"])
         case .codexArchivedSessions:
-            try requireSessionFile(url, parts: parts, prefix: [".codex", "archived_sessions"])
+            try requireSessionFile(url, rule: rule, parts: parts, prefix: [".codex", "archived_sessions"])
         case .claudeProjectSessions:
-            // 绝不能删除项目根目录本身；必须是 .claude/projects 下的 .jsonl 会话文件
-            try requireSessionFile(url, parts: parts, prefix: [".claude", "projects"])
+            // 绝不能删除项目根目录本身；必须是 .claude/projects 下的会话文件
+            try requireSessionFile(url, rule: rule, parts: parts, prefix: [".claude", "projects"])
         case .claudeFileHistory:
             guard parts.count >= 2, parts[0] == ".claude", parts[1] == "file-history" else {
                 throw MacEvenError(localized("路径不在 Claude 文件快照白名单内：\(path)"))
@@ -347,6 +378,10 @@ public final class AIWorkCleanup: @unchecked Sendable {
             guard parts.count >= 2, parts[0] == ".claude", parts[1] == "plans" else {
                 throw MacEvenError(localized("路径不在 Claude 计划白名单内：\(path)"))
             }
+        case .antigravitySessions:
+            try requireSessionFile(url, rule: rule, parts: parts, prefix: [".gemini", "antigravity", "conversations"])
+        case .antigravityCliSessions:
+            try requireSessionFile(url, rule: rule, parts: parts, prefix: [".gemini", "antigravity-cli", "conversations"])
         }
 
         if let reason = protection.reason(for: url) {
@@ -354,11 +389,11 @@ public final class AIWorkCleanup: @unchecked Sendable {
         }
     }
 
-    /// 会话规则只接受 .jsonl 会话文件：目录、快捷方式与其他格式一律拒绝。
-    private func requireSessionFile(_ url: URL, parts: [Substring], prefix: [Substring]) throws {
+    /// 会话规则只接受单个会话文件（.jsonl 或会话 .db）：目录、快捷方式与其他格式一律拒绝。
+    private func requireSessionFile(_ url: URL, rule: AIWorkCleanupRule, parts: [Substring], prefix: [Substring]) throws {
         guard parts.count >= prefix.count + 1, Array(parts.prefix(prefix.count)) == prefix,
-              url.pathExtension.lowercased() == "jsonl" else {
-            throw MacEvenError(localized("会话目录仅允许清理单个 .jsonl 会话文件，目录与其他格式已保留：\(url.path)"))
+              url.pathExtension.lowercased() == rule.sessionFileExtension else {
+            throw MacEvenError(localized("会话目录仅允许清理单个会话文件，目录与其他格式已保留：\(url.path)"))
         }
     }
 
@@ -376,7 +411,7 @@ public final class AIWorkCleanup: @unchecked Sendable {
         while !token.isCancelled, let url = autoreleasepool(invoking: { enumerator.nextObject() as? URL }) {
             visited += 1
             guard visited <= 1_000_000, found.count < 8192 else { issue = localized("\(rule.title)候选达到上限，部分记录保留。"); break }
-            if url.pathExtension.lowercased() == "jsonl", (try? validateSafety(url, rule: rule)) != nil,
+            if url.pathExtension.lowercased() == rule.sessionFileExtension, (try? validateSafety(url, rule: rule)) != nil,
                (try? FileIdentity.read(url).isRegular) == true { found.append(url) }
         }
         if let issue { warnings.append(issue) }
@@ -422,10 +457,17 @@ public final class AIWorkCleanup: @unchecked Sendable {
                         roots[url.path] = root
                         // 会话文件按修改时间与记录的工作目录补充说明；读取失败或无法确认时保持保守。
                         let context = rule.isSessionFile ? AIWorkSessionProbe.context(of: url, identity: identity) : nil
+                        // 目录型候选的活跃度看内部文件的最新内容 mtime，而不是目录自身 mtime；空目录回退到目录自身。
+                        var newestContent: Date?
+                        if identity.isDirectory {
+                            let newest = (try? index.newestModified(inSubtreeOf: root)) ?? identity.modified
+                            newestContent = Date(timeIntervalSince1970: Double(newest) / 1_000_000_000)
+                        }
                         targets.append(AIWorkCleanupTarget(rule: rule, url: url, allocatedSize: try index.entry(id: root)?.allocatedSize ?? 0,
                             identity: identity, ancestors: parents, impact: rule.impact,
                             modifiedAt: Date(timeIntervalSince1970: Double(identity.modified) / 1_000_000_000),
-                            projectPath: context?.projectPath, projectName: context?.projectName, projectMissing: context?.projectMissing == true))
+                            projectPath: context?.projectPath, projectName: context?.projectName, projectMissing: context?.projectMissing == true,
+                            newestContentModified: newestContent))
                     } catch { warnings.append(error.localizedDescription) }
                 }
                 if rule.isSessionFile { try index.commit() }
@@ -532,10 +574,22 @@ public final class AIWorkCleanup: @unchecked Sendable {
                 guard let root = roots[target.id], let entry = try index.entry(id: root) else { return nil }
                 return AIWorkCleanupTarget(rule: target.rule, url: target.url, allocatedSize: entry.allocatedSize,
                     identity: target.identity, ancestors: target.ancestors, impact: target.impact, modifiedAt: target.modifiedAt,
-                    projectPath: target.projectPath, projectName: target.projectName, projectMissing: target.projectMissing)
+                    projectPath: target.projectPath, projectName: target.projectName, projectMissing: target.projectMissing,
+                    newestContentModified: target.newestContentModified)
             }
             return retained.isEmpty ? nil : AIWorkCleanupGroup(rule: group.rule, targets: retained)
         }
+    }
+
+    /// 「查看构成」：从本次扫描索引读取目录型候选的直接子项（按占用排序）；只读，不引入新扫描。
+    public func composition(of target: AIWorkCleanupTarget, limit: Int = 20) throws -> CleanupComposition? {
+        guard target.identity.isDirectory, let index, let root = roots[target.id] else { return nil }
+        let total = try index.childCount(of: root)
+        let entries = try index.children(of: root, offset: 0, limit: max(1, min(limit, 100))).map { child in
+            CleanupCompositionEntry(url: child.url, allocatedSize: child.allocatedSize, isDirectory: child.isDirectory,
+                modifiedAt: Date(timeIntervalSince1970: Double(child.identity.modified) / 1_000_000_000))
+        }
+        return CleanupComposition(root: target.url, entries: entries, totalChildren: total, measuredLive: false)
     }
 
     public func move(

@@ -12,6 +12,7 @@ struct AICleanupPanelView: View {
 
     @Environment(\.advancedMode) private var advanced
     @AICleanupViewState private var sessionOffsets: [String: Int] = [:]
+    @StateObject private var compositionPresenter = CleanupCompositionPresenter()
 
     private var cacheGroups: [DeveloperCleanupGroup] { developer.aiCacheGroups }
 
@@ -159,7 +160,7 @@ struct AICleanupPanelView: View {
                 Text(advisory).font(.caption).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
             }
-            if let path = group.paths.first { pathRow(path) }
+            if let path = group.paths.first { pathRow(path, composition: { await developer.composition(of: group) }) }
         }
         .padding(.vertical, 2)
     }
@@ -262,14 +263,24 @@ struct AICleanupPanelView: View {
                 Spacer(minLength: 8)
                 Text(bytes(target.allocatedSize)).font(.caption.weight(.medium)).monospacedDigit()
             }
-            pathRow(target.url)
+            pathRow(target.url, composition: compositionProvider(target))
         }
         .padding(.vertical, 1)
+    }
+
+    /// 目录型会话/工作记录候选才提供「查看构成」；provider 用显式返回类型避免三元推断退化。
+    private func compositionProvider(_ target: AIWorkCleanupTarget) -> (@MainActor () async -> CleanupComposition?)? {
+        guard target.identity.isDirectory else { return nil }
+        return { [smart] in await smart.aiWorkComposition(of: target) }
     }
 
     private func targetDetail(_ target: AIWorkCleanupTarget) -> String {
         var parts: [String] = []
         if let date = target.modifiedAt { parts.append(localized("最后修改 ") + date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, locale: localizationLocale))) }
+        // 目录型候选并列展示目录 mtime 与内部最新内容 mtime：两者差异大说明目录时间老但内容仍活跃。
+        if target.identity.isDirectory, let newest = target.newestContentModified {
+            parts.append(localized("最近内容修改 ") + newest.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, locale: localizationLocale)))
+        }
         if let name = target.projectName { parts.append(localized("项目 \(name)") + (target.projectMissing ? localized("（已不存在）") : "")) }
         parts.append(advanced ? target.url.path : displayPath(target.url))
         return parts.joined(separator: " · ")
@@ -372,7 +383,7 @@ struct AICleanupPanelView: View {
                 Text(item.issue != nil && item.allocatedSize == 0 ? localized("未统计") : bytes(item.allocatedSize))
                     .font(.caption.weight(.medium)).monospacedDigit()
             }
-            pathRow(item.location.url)
+            pathRow(item.location.url, composition: { await smart.aiStorageComposition(of: item) })
         }
         .padding(.vertical, 2)
     }
@@ -422,12 +433,15 @@ struct AICleanupPanelView: View {
         .accessibilityHint(localized("点击\(expanded ? localized("收起") : localized("展开"))明细"))
     }
 
-    private func pathRow(_ url: URL) -> some View {
+    private func pathRow(_ url: URL, composition provider: (@MainActor () async -> CleanupComposition?)? = nil) -> some View {
         HStack(spacing: 6) {
             Text(displayPath(url))
                 .font(.system(size: 11)).foregroundStyle(Theme.muted)
                 .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
             Spacer(minLength: 4)
+            if let provider {
+                CompositionButton(label: localized("查看构成"), provider: provider, presenter: compositionPresenter)
+            }
             Button(localized("在 Finder 查看")) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
                 .controlSize(.small).buttonStyle(.borderless).font(.system(size: 11))
         }
